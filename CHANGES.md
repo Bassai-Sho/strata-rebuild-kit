@@ -1,4 +1,28 @@
 # What changed, newest first
+## 2026-10-17.10
+- **Lessons, second pass** (`agent/codex-loop.py`), after reading how Hermes Agent (Nous Research) handles its bounded memory. Five changes, all tested. Nothing here lets an
+  agent, or the loop, write a lesson: a person still promotes every one.
+- **What does not fit is reported.** The file may hold 40 lessons, but a project gets at most 10 lines and 1400 characters, so lessons past that were silently left out for the
+  project. The run output, `--dry-run`, `loop-report.md` and `--lessons list` now say how many were left out and which. `list` also shows the room per project type
+  (`all` only, each tag with `all`, every tag at once), and `--lessons add` warns when the new lesson will not fit.
+- **`--lessons remove --arg "some of its text"`** replaces `remove --arg N` from .9. A position moves when the file changes between `list` and `remove`; text does not. A number,
+  text under 4 characters, no match, or text that matches two lessons is refused (the matches are shown).
+- **Backups.** Every `add` or `remove` first copies the file to `~/agent/lessons/backups/LESSONS-DATE-TIME.md` (the newest 20 are kept). A refused change makes none.
+- **`add` refuses unsafe text:** web addresses, network commands (curl, wget, ssh and the like), risky shell (sudo, rm -rf, `| sh`), wording that tries to override other
+  instructions, credentials, and paths outside the project. A false alarm can be written into the file by hand; the loop does not lint a person's own file.
+- **Candidates are grouped and counted.** `--lessons candidates` groups the same problem (same kind, same project tags, same first thing that went wrong, numbers ignored), most
+  frequent first, marked "repeats: worth a lesson" from 2 up; `--arg raw` shows every record. At the end of a run the loop says when a problem it just recorded has now happened
+  2 or more times.
+- **Borrowed from Hermes, and not.** Borrowed: visible capacity, matching by text, restorable backups, a lint on entries, a nudge when something repeats. Not borrowed: agent-written
+  memory (its own docs say models under about 30B often claim a save without calling the tool), the background review fork (on a local model it occupies the GPU for minutes),
+  user modelling, the messaging gateways, cron and the cloud backends.
+- **Tests:** 52 in `tests/test_codex_loop.py` (35 in .9). A hand-run mutation check broke the code 26 ways (the ten from .9 at their new places and 16 new ones); all 26 are
+  caught after two weak tests were strengthened (a refused `remove 1` was checked only by exit code; a grouping test always varied other fields too). The check is not part of the
+  suite. Add the full-suite total from your own run: ______ tests.
+- **Not tested:** Docker and the real Codex and model with lessons present; whether lessons improve results (compare attempts and reverts in `loop-report.md` with and without one);
+  `codex lessons` is still not wired into the `codex` command, so run the script directly.
+To adopt: `bash kit.sh update`, then `python3 ~/agent/bin/codex-loop.py --lessons list` (check the path with `ls ~/agent/bin/`). `remove --arg N` from .9 no longer works: use some
+of the lesson's own text.
 ## 2026-10-17.9
 - **Lessons for `codex loop`** (`agent/codex-loop.py`): a global file, `~/agent/lessons/LESSONS.md`, holds short rules learned from earlier runs, one line each
   (`- [web] Create every file the page links in the same task.`). The LOOP copies the lines that fit the project (tag `all`, or a tag taken from the file types in

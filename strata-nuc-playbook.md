@@ -268,8 +268,10 @@ codex loop NAME --dry-run               # shows the plan, the lint result and th
 codex loop NAME --sessions 2 --minutes 15      # a first, short trial
 codex loop NAME                         # then the real run (12 sessions of up to 45 minutes by default)
 codex check NAME                        # afterwards: run the project's check yourself, and look at artifacts/screenshot.png
-python3 ~/agent/bin/codex-loop.py --lessons candidates     # what the loop recorded after a retry, a block or reverted files
-python3 ~/agent/bin/codex-loop.py --lessons add --arg "- [web] text"      # promote one; also: list, remove --arg N
+python3 ~/agent/bin/codex-loop.py --lessons candidates                    # what the loop recorded, grouped and counted (--arg raw: every record)
+python3 ~/agent/bin/codex-loop.py --lessons add --arg "- [web] text"      # promote one (refused if unsafe, duplicate or over the limits)
+python3 ~/agent/bin/codex-loop.py --lessons list                          # the file, and the room per project type
+python3 ~/agent/bin/codex-loop.py --lessons remove --arg "some of its text"
 ```
 Stop it with a file named `STOP` in the project folder, or Ctrl+C. The report is `~/agent/logs/loop-NAME-DATE/loop-report.md`; the session logs and anything the loop reverted are in the same folder. Plans can come from the interactive session (the workspace rules tell it how) or from a cloud planner (section 9 of the earlier research: the plan format is the same).
 
@@ -299,15 +301,19 @@ Also verified (and again on 0.163.0 by the probe suite): the real Codex 0.162.1 
 
 | What | How it works |
 |---|---|
-| Delivery | The loop appends the matching lines (at most 10, 1,400 characters) to the `AGENTS.md` of the session's private Codex home. The master rules and the lessons folder are not mounted into any container, and each session gets a fresh copy, so an agent cannot read, edit or carry over a lesson. The text is read once at the start of a run, so it is the same bytes in every session |
+| Delivery | The loop appends the matching lines (at most 10 lines and 1,400 characters, in file order) to the `AGENTS.md` of the session's private Codex home. The master rules and the lessons folder are not mounted into any container and each session gets a fresh copy, so an agent cannot read, edit or carry over a lesson. The text is read once at the start of a run, so it is the same bytes in every session |
+| Room | The file may hold 40 lessons but a project gets 10 lines. Lessons that do not fit are never cut silently: the run, `--dry-run`, `loop-report.md` and `--lessons list` say how many were left out and which, and `list` shows the room for each kind of project. Lessons higher in the file are kept first, so order is your priority |
 | Cost | The lessons sit in the same message as the project's path and rules, after the shared prompt prefix, so they are re-read once per new project and stay cached within a project. Worst case about 400 tokens, roughly 10 seconds at 42 tok/s (an estimate, not measured) |
 | Capture | The loop, not the agent, records a candidate in `lessons/candidates.jsonl` when a task is fixed on a retry, is blocked, or passes with reverted files. It holds the check output tail, file names, attempt count and the id of the lessons in force, cut to one line of printable ASCII. Nothing the agent wrote is copied, and nothing is ever injected without you |
-| Promotion | You read `--lessons candidates` and add a line with `--lessons add`. The tool refuses lines that are not plain ASCII, are longer than 220 characters, duplicate one, or would make a 41st |
+| Counting | `--lessons candidates` groups the same problem (same kind, same project tags, same first failure with numbers ignored), most frequent first, marked "repeats: worth a lesson" from 2 up. At the end of a run the loop says when a problem it just recorded has now happened 2 or more times. `--arg raw` shows every record |
+| Promotion | You read the candidates and add a line with `--lessons add`. It refuses lines that are not plain ASCII, are longer than 220 characters, duplicate one, would make a 41st, or contain a web address, a network or risky shell command, wording that tries to override other instructions, a credential or a path outside the project (a false alarm can be written into the file by hand). It warns when the new lesson will not fit |
+| Removing | `--lessons remove --arg "some of its text"`: positions move when the file changes, text does not. A number, too little text, or text matching two lessons is refused |
+| Backups | Every add or remove first copies the file to `~/agent/lessons/backups/` (the newest 20 are kept). To undo a change, copy a backup over `LESSONS.md` |
 
-Habits that keep it useful: first ask whether the plan lint, the template or the planner's rules can enforce it, because a rule you can enforce beats a lesson. Promote only a
-failure that happened twice, or once if it was expensive. Keep the list short and each line a trigger plus an action. Put `# why: ... remove when: ...` on a comment line above
-each lesson (comments are ignored by the loop and kept by `add` and `remove`). Judge a lesson by running the same small project with and without it and comparing attempts,
-reverts and minutes in `loop-report.md`. Edit between runs, not during one.
+Habits that keep it useful: first ask whether the plan lint, the template or the planner's rules can enforce it, because a rule you can enforce beats a lesson. Promote only a failure
+that happened twice (the counting does this for you), or once if it was expensive. Keep the list short and each line a trigger plus an action; a lesson that only restates something the
+model can look up, or a one-off event, does not belong. Put `# why: ... remove when: ...` on a comment line above each lesson (comments are ignored by the loop and kept by `add` and
+`remove`). Judge a lesson by running the same small project with and without it and comparing attempts, reverts and minutes in `loop-report.md`. Edit between runs, not during one.
 
 **Not tested, so treat the first runs as trials:** the Docker flags on your machine (`codex gate-test` is the test); whether Codex starts and runs cleanly with no network (it may try to reach OpenAI for update checks and fail quietly); `browser-check` inside the no-network container; the real model's behaviour (does it write a good plan, does it stay inside its files); and timings. A session costs about 15 s to start, 5 to 15 s per turn of reading, and generates at about 9 tok/s, so a 4K-token task is roughly 10 to 25 minutes including the check; 8 tasks is an evening, plus any retries.
 the real Codex and model with lessons present; whether lessons improve results; codex lessons is not wired into the codex command; interactive codex NAME sessions do not get lessons.
@@ -449,10 +455,12 @@ Full screening of 13 settings and two ABBA confirmations, 16 October. Effects sm
 | Decode or answers are worse after a Strata update | `strata-update.py rollback` (section 9); if only speed: try `env.STRATA_Q6_PLANAR=0`; if the writing changed: the `sampling` block (section 9, 0.1.45 table) |
 | Disk is full / I want an old model gone | `strata-models.py list`, then `remove TAG` (preview, then `--yes`); Section 9 |
 | Desktop sluggish while the model loads | About 40 GiB is loading into shared memory; it clears when `ready:` appears. Close heavy apps first. |
-| A lesson does not reach the agent | `--lessons list` (a line that starts with `- ` but does not match `- [tag] text`, or is over 220 characters, is ignored and counted there); the run prints `Lessons in force: N line(s) for tags: ...`; a tag must be `all` or match the project's file types |
-| A new lesson does not show in the dry run | The tag does not match: web needs `.html`, `.css` or a `browser-check` in the plan; the dry run lists exactly what would be injected |
-| `--lessons add` says "not added" | Use one line of plain ASCII, `- [tag] text`, tag in lower case letters, digits, comma, dash, and text of at most 220 characters; no duplicates; at most 40 lines |
-| Candidates are empty after a run | Clean first-time passes record nothing. Only a retry, a block or reverted files do |
+| A lesson does not reach the agent | `--lessons list` (a line that starts with `- ` but does not match `- [tag] text`, or is over 220 characters, is ignored and counted there); the run prints `Lessons in force: N line(s) for tags: ...`; a tag must be `all` or match the project's file types; the run and `list` say if it was left out because 10 lines or 1,400 characters were used |
+| The run says lessons "did NOT fit" | Too many lessons match this kind of project. Lessons higher in the file are kept first: reorder, shorten or remove (`--lessons list` shows the room for each project type) |
+| `--lessons add` says "not added" | Read the reason it prints: not plain ASCII or wrong shape (`- [tag] text`, tag in lower case letters, digits, comma, dash, text up to 220 characters), a duplicate, the 40-line limit, or text that looks unsafe (web address, network or risky shell command, override wording, credential, path outside the project). For a false alarm, write the line into the file by hand |
+| `--lessons remove` says "not a number" or "contain that text" | Use some of the lesson's own text (4 characters or more); if two lessons match, use more of it |
+| A lesson I changed or removed is wrong | Copy a file from `~/agent/lessons/backups/` over `~/agent/lessons/LESSONS.md` |
+| Candidates are empty after a run | A clean first-time pass records nothing. Only a retry, a block or reverted files do |
 
 ---
 

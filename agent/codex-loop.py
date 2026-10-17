@@ -3,7 +3,7 @@
 
     codex loop NAME [--sessions 12] [--minutes 45] [--attempts 3] [--hours 8] [--dry-run] [--yes]
                     [--allow-new-files] [--clean-retry] [--accept-prepassed]
-    codex-loop.py --lessons list | candidates | add --arg "- [web] text" | remove --arg N       (the global lessons, see below)
+    codex-loop.py --lessons list | candidates [--arg raw] | add --arg "- [web] text" | remove --arg "some of its text"      (the global lessons, see below)
 
 Why a loop of short sessions: a fresh session starts in about 15 s (Strata caches the shared prompt), a long one has to be compacted
 (about 12 minutes), and the plan, the progress notes and git carry the memory between sessions. The prompt is identical every time,
@@ -26,7 +26,9 @@ LESSONS: ~/agent/lessons/LESSONS.md holds short rules learned from earlier runs,
 that fit the project (tag `all`, or a tag from the file types in PLAN.md) into the session's private copy of the Codex home; the agent cannot read the
 master file or change what the next session gets. The loop never writes a lesson itself: after a task that needed a retry, was blocked, or had files
 reverted, it records a CANDIDATE (check output tails and file names only, never the agent's own words) in lessons/candidates.jsonl, and you promote
-one with `--lessons add`. At most 10 lines and 1400 characters are injected; the text is fixed for the whole run so Strata's prompt cache holds.
+one with `--lessons add`. At most 10 lines and 1400 characters are injected (what does not fit is reported, never cut silently); the text is fixed for the whole
+run so Strata's prompt cache holds. `--lessons candidates` groups the same problem together and says how often it happened; `add` refuses text that looks like injection,
+a web address, a network or risky shell command or a credential; `remove` takes some of the lesson's own text (positions move); every change keeps a backup in lessons/backups.
 
 Stop it with a file named STOP in the project folder, or Ctrl+C. Each run writes loop-report.md in ~/agent/logs/loop-NAME-DATE/.
 """
@@ -125,25 +127,84 @@ def project_tags(tasks):
     return tags
 
 
-def lessons_block(tags):
-    """(text, lines): the lessons for a project with these tags. Same bytes every call while the file is unchanged: no dates, no counters."""
+def lessons_plan(tags):
+    """(text, lines, left_out): the lessons for a project with these tags, in file order, until the limits are reached. Same bytes every call
+    while the file is unchanged: no dates, no counters. `left_out` are matching lessons that did not fit, so nobody is surprised by a silent cut."""
     want = {"all"} | set(tags)
+    matching = [line for t, line in load_lessons() if t & want]
     picked, size = [], 0
-    for t, line in load_lessons():
-        if t & want:
-            if len(picked) >= LESSON_LINES_MAX or size + len(line) + 1 > LESSON_CHARS_MAX:
-                break
-            picked.append(line)
-            size += len(line) + 1
-    return ((LESSON_HEADER + "\n" + "\n".join(picked) + "\n") if picked else ""), picked
+    for line in matching:
+        if len(picked) >= LESSON_LINES_MAX or size + len(line) + 1 > LESSON_CHARS_MAX:
+            break
+        picked.append(line)
+        size += len(line) + 1
+    return ((LESSON_HEADER + "\n" + "\n".join(picked) + "\n") if picked else ""), picked, matching[len(picked):]
+
+
+def lessons_block(tags):
+    """(text, lines): what lessons_plan injects."""
+    text, picked, _ = lessons_plan(tags)
+    return text, picked
 
 
 def lessons_id(block):
     return hashlib.sha256(block.encode()).hexdigest()[:10] if block else ""
 
 
+def lessons_usage():
+    """[(label, n_matching, n_injected, chars, left_out)] for the lessons file: tag `all` alone, each tag with `all`, and every tag at once."""
+    items = load_lessons()
+    tags = sorted({t for ts, _ in items for t in ts} - {"all"})
+    rows = []
+    for label, ts in [("all only", set())] + [(f"all + {t}", {t}) for t in tags] + ([("every tag at once", set(tags))] if len(tags) > 1 else []):
+        _, picked, left = lessons_plan(ts)
+        rows.append((label, len(picked) + len(left), len(picked), sum(len(x) + 1 for x in picked), left))
+    return rows
+
+
+# What a pasted lesson may not contain. A person promotes lessons, but the text may come from a candidate or from anywhere else; these are
+# the shapes of injection, exfiltration and risky commands. A false positive can be written into the file by hand.
+LESSON_LINT = [
+    (re.compile(r"https?://|\bwww\.", re.I), "a web address"),
+    (re.compile(r"\b(curl|wget|scp|sftp|ssh|ftp|netcat|ncat|nc)\b", re.I), "a network command"),
+    (re.compile(r"\b(sudo|chmod|chown|eval|base64)\b|\brm\s+-\w*r|\|\s*(ba|z)?sh\b", re.I), "a risky shell command"),
+    (re.compile(r"\b(ignore|disregard|forget|override)\b.{0,30}\b(previous|prior|earlier|above|all|any|the)\b.{0,30}\b(rules?|instructions?|prompts?|lessons?)\b"
+                r"|\byou are now\b|\bnew instructions\b|\b(system|developer) (prompt|message)\b", re.I), "wording that tries to override other instructions"),
+    (re.compile(r"\b(passwords?|passwd|api[ _-]?keys?|private keys?|ssh keys?|credentials?|access tokens?|api tokens?)\b", re.I), "a secret or credential"),
+    (re.compile(r"(^|[\s\"'(])(~/|/home/|/etc/|/root/|/mnt/)"), "a path outside the project"),
+]
+
+
+def lint_lesson(text):
+    """The reason a lesson's text is refused, or None."""
+    for rx, why in LESSON_LINT:
+        if rx.search(text):
+            return why
+    return None
+
+
+BACKUP_RE = re.compile(r"^LESSONS-\d{8}-\d{6}-\d{6}\.md$")
+BACKUPS_KEEP = 20
+
+
+def backup_lessons():
+    """Copy the current lessons file to lessons/backups/ before a change (the newest BACKUPS_KEEP are kept). Returns the copy's path or None."""
+    try:
+        old = read_text(lessons_path())
+    except OSError:
+        return None
+    if not old.strip():
+        return None
+    d = os.path.join(lessons_dir(), "backups")
+    dst = os.path.join(d, f"LESSONS-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}.md")
+    write_atomic(dst, old)
+    for name in sorted(f for f in os.listdir(d) if BACKUP_RE.match(f))[:-BACKUPS_KEEP]:
+        os.remove(os.path.join(d, name))
+    return dst
+
+
 def record_candidate(project, task, tags, lid, kind, attempts, failed, files, reverted):
-    """Best effort: a candidate lesson, built only from what the loop itself saw. Never injected anywhere; a person reads it."""
+    """Best effort: a candidate lesson, built only from what the loop itself saw. Never injected anywhere; a person reads it. Returns the record or None."""
     try:
         rec = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "project": clean(project, 60), "task": task.id,
                "goal": clean(task.goal, 120), "tags": sorted(tags), "kind": kind, "attempts": attempts,
@@ -156,10 +217,52 @@ def record_candidate(project, task, tags, lid, kind, attempts, failed, files, re
             lines = fh.read().splitlines()
         if len(lines) > CAND_MAX:
             write_atomic(candidates_path(), "\n".join(lines[-CAND_KEEP:]) + "\n")
-        return True
+        return rec
     except OSError as e:
         say(f"           (could not record a lesson candidate: {e})")
-        return False
+        return None
+
+
+def load_candidates():
+    try:
+        rows = read_text(candidates_path()).splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in rows:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(r, dict):
+            out.append(r)
+    return out
+
+
+def candidate_signature(r):
+    """What makes two candidates the same problem: the kind, the project tags, and the FIRST thing that went wrong (numbers ignored)."""
+    norm = lambda x: re.sub(r"\d+", "#", clean(x, 300).lower())
+    failed = r.get("failed") or []
+    core = norm(failed[0].get("check", "")) if failed else "reverted: " + ",".join(sorted(norm(x) for x in r.get("reverted", [])))
+    return (r.get("kind", ""), tuple(sorted(r.get("tags", []))), core)
+
+
+def candidate_groups(rows):
+    """[{sig, count, projects, last, files, check, kind, tags}] most frequent first."""
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(candidate_signature(r), {"sig": candidate_signature(r), "count": 0, "projects": [], "files": [], "last": ""})
+        g["count"] += 1
+        if r.get("project") not in g["projects"]:
+            g["projects"].append(r.get("project"))
+        for f in r.get("files", []):
+            if f not in g["files"]:
+                g["files"].append(f)
+        g["last"] = max(g["last"], r.get("time", ""))
+        g["kind"], g["tags"] = r.get("kind", ""), r.get("tags", [])
+        fl = r.get("failed") or []
+        g["check"] = fl[0].get("check", "") if fl else "(reverted: " + ", ".join(r.get("reverted", [])) + ")"
+    return sorted(sorted(groups.values(), key=lambda g: g["last"], reverse=True), key=lambda g: -g["count"])
 
 
 def lessons_cli(act, arg):
@@ -176,27 +279,34 @@ def lessons_cli(act, arg):
             skipped = 0
         if skipped:
             say(f"  ({skipped} line(s) that start with '- ' are ignored: they do not match  - [tag] text  or are too long)")
+        if items:
+            say(f"\nRoom per project type (limits: {LESSON_LINES_MAX} lines, {LESSON_CHARS_MAX} characters; lessons higher in the file are kept first):")
+            for label, total, injected, chars, left in lessons_usage():
+                say(f"  {label:20s} {injected} of {total} lines injected, {chars} characters" + (f", {len(left)} LEFT OUT: {left[0][:60]}..." if left else ""))
         return 0
     if act == "candidates":
-        try:
-            with open(candidates_path(), errors="replace") as fh:
-                rows = fh.read().splitlines()[-20:]
-        except OSError:
-            rows = []
+        rows = load_candidates()
         if not rows:
             say("no candidates yet")
-        for ln in rows:
-            try:
-                r = json.loads(ln)
-            except ValueError:
-                continue
-            say(f"{r.get('time', '')}  {r.get('project', '')}/{r.get('task', '')}  {r.get('kind', '')}  attempts={r.get('attempts', '')}  tags={','.join(r.get('tags', []))}  lessons={r.get('lessons', '')}")
-            for f in r.get("failed", []):
-                say(f"    attempt {f.get('attempt')}: check said: {f.get('check', '')}" + (f"   reverted: {', '.join(f.get('reverted', []))}" if f.get("reverted") else ""))
-            if r.get("files"):
-                say(f"    files changed by the attempt that ended it: {', '.join(r['files'])}")
-            if r.get("reverted"):
-                say(f"    reverted in that attempt: {', '.join(r['reverted'])}")
+            return 0
+        if arg == "raw":
+            for r in rows[-20:]:
+                say(f"{r.get('time', '')}  {r.get('project', '')}/{r.get('task', '')}  {r.get('kind', '')}  attempts={r.get('attempts', '')}  tags={','.join(r.get('tags', []))}  lessons={r.get('lessons', '')}")
+                for f in r.get("failed", []):
+                    say(f"    attempt {f.get('attempt')}: check said: {f.get('check', '')}" + (f"   reverted: {', '.join(f.get('reverted', []))}" if f.get("reverted") else ""))
+                if r.get("files"):
+                    say(f"    files changed by the attempt that ended it: {', '.join(r['files'])}")
+                if r.get("reverted"):
+                    say(f"    reverted in that attempt: {', '.join(r['reverted'])}")
+            return 0
+        groups = candidate_groups(rows)
+        say(f"{len(rows)} candidate(s) in {len(groups)} kind(s) of problem, most frequent first (add --arg raw for every record):")
+        for g in groups:
+            say(f"\n{g['count']}x  {g['kind']}  tags={','.join(g['tags']) or '-'}  projects: {', '.join(g['projects'])}" + ("   <- repeats: worth a lesson" if g["count"] >= 2 else ""))
+            say(f"    check said: {g['check']}")
+            if g["files"]:
+                say(f"    changed in the attempt that ended it: {', '.join(g['files'])}")
+            say(f"    last seen: {g['last']}")
         return 0
     if act == "add":
         line = arg if arg.startswith("- ") else "- " + arg
@@ -204,41 +314,58 @@ def lessons_cli(act, arg):
             say('not added: write one line of plain ASCII like  - [web] Create every file the page loads in the same task.  '
                 '(tag: letters, digits, comma, dash; text up to 220 characters; tag `all` applies to every project)')
             return 2
+        why = lint_lesson(line)
+        if why:
+            say(f"not added: the text contains {why}. A lesson is plain advice about the work; if this is a false alarm, write the line into {path} by hand.")
+            return 2
         items = load_lessons()
         if len(items) >= LESSONS_FILE_MAX:
-            say(f"not added: the file already has {len(items)} lessons (limit {LESSONS_FILE_MAX}). Remove one first: --lessons remove --arg N")
+            say(f"not added: the file already has {len(items)} lessons (limit {LESSONS_FILE_MAX}). Remove one first: --lessons remove --arg 'some of its text'")
             return 2
         if line.lower() in [x.lower() for _, x in items]:
             say("not added: that lesson is already there")
             return 2
+        bak = backup_lessons()
         try:
             old = read_text(path)
         except OSError:
             old = ""
         write_atomic(path, (old if not old or old.endswith("\n") else old + "\n") + line + "\n")
-        say(f"added. {len(items) + 1} lesson(s) in {path}")
+        say(f"added. {len(items) + 1} lesson(s) in {path}" + (f"   (previous file saved as {bak})" if bak else ""))
+        tags = set(LESSON_RE.match(line).group(1).split(","))
+        known = sorted({t for ts, _ in load_lessons() for t in ts} - {"all"})
+        check_sets = [{t} for t in sorted(tags - {"all"})] + ([set()] + [{t} for t in known] if "all" in tags else [])
+        for ts in check_sets:
+            _, _, left = lessons_plan(ts)
+            if line in left:
+                say(f"  WARNING: for projects tagged {', '.join(sorted(ts)) or 'all only'} this lesson does NOT fit (limits {LESSON_LINES_MAX} lines, {LESSON_CHARS_MAX} characters); "
+                    "lessons above it take the room. Shorten or remove one.")
+                break
         return 0
     if act == "remove":
-        if not arg.isdigit() or int(arg) < 1:
-            say("remove needs the number shown by --lessons list:  --lessons remove --arg 3")
+        q = clean(arg, 100)
+        if len(q) < 4 or q.isdigit():
+            say("remove needs some of the lesson's own text (at least 4 characters), not a number: numbers move when the file changes.\n"
+                "  example:  --lessons remove --arg 'every file the page loads'")
             return 2
-        n, kept, gone = 0, [], None
         try:
             lines = read_text(path).splitlines()
         except OSError:
             lines = []
-        for ln in lines:
-            if LESSON_RE.match(clean(ln, 400)):
-                n += 1
-                if n == int(arg):
-                    gone = ln
-                    continue
-            kept.append(ln)
-        if gone is None:
-            say(f"no lesson number {arg}")
+        hits = [(i, ln) for i, ln in enumerate(lines) if LESSON_RE.match(clean(ln, 400)) and q.lower() in clean(ln, 400).lower()]
+        if not hits:
+            say("no lesson contains that text")
             return 2
+        if len(hits) > 1:
+            say(f"{len(hits)} lessons contain that text; use more of it:")
+            for _, ln in hits:
+                say(f"  {ln}")
+            return 2
+        bak = backup_lessons()
+        i, gone = hits[0]
+        kept = lines[:i] + lines[i + 1:]
         write_atomic(path, "\n".join(kept) + ("\n" if kept else ""))
-        say(f"removed: {gone}")
+        say(f"removed: {gone}" + (f"   (previous file saved as {bak})" if bak else ""))
         return 0
     return 2
 
@@ -528,7 +655,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("name", nargs="?")
     ap.add_argument("--lessons", choices=("list", "candidates", "add", "remove"), help="show or edit the global lessons (a person's job; the loop only records candidates)")
-    ap.add_argument("--arg", default="", help="the lesson line for --lessons add, or the number for --lessons remove")
+    ap.add_argument("--arg", default="", help="--lessons add: the lesson line; remove: some of the lesson's own text; candidates: `raw` for every record")
     ap.add_argument("--sessions", type=int, default=12, help="most sessions in this run (default 12)")
     ap.add_argument("--minutes", type=float, default=45, help="time limit of one session (default 45)")
     ap.add_argument("--attempts", type=int, default=3, help="attempts per task before the loop stops (default 3)")
@@ -567,12 +694,17 @@ def main(argv=None):
         say("Nothing to do.")
         return 0
     tags = project_tags(tasks)
-    lessons_text, picked = lessons_block(tags)
+    lessons_text, picked, left_out = lessons_plan(tags)
     lid = lessons_id(lessons_text)
     say(f"Lessons in force: {len(picked)} line(s) for tags: {', '.join(sorted({'all'} | tags))}" + (f" (id {lid})" if lid else ""))
+    if left_out:
+        say(f"  warning: {len(left_out)} matching lesson(s) did NOT fit (limits {LESSON_LINES_MAX} lines, {LESSON_CHARS_MAX} characters) and are left out: {left_out[0][:70]}...  "
+            "(see the room per project type: --lessons list)")
     if a.dry_run:
         for ln in picked:
             say(f"  {ln}")
+        for ln in left_out:
+            say(f"  LEFT OUT: {ln}")
         say("\nA session would run:\n  " + " ".join(agent_command(proj, a.name, "<fresh copy of codex-home>", a.minutes)[:-1]) + " <the fixed prompt>")
         say("A check would run:\n  " + " ".join(check_docker_command(proj, a.name, todo[0].cmd, CHECK_SECONDS)))
         say("\n(dry run: nothing was run)")
@@ -597,7 +729,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, lambda *_: stop_flag.update(stop=True))
     t_start = time.time()
     events, sessions, attempts, idle, idle_reverted = [], 0, {}, 0, False
-    fails, cand_n = {}, 0                 # per task: what each failed attempt looked like (for a lesson candidate)
+    fails, cand_n, run_sigs = {}, 0, set()    # per task: what each failed attempt looked like (for a lesson candidate); the problems this run recorded
     task_bases = {}                       # the commit each task started from (attempts that fail are kept on top of it)
     reason = ""
 
@@ -715,7 +847,10 @@ def main(argv=None):
             log_event(task=task.id, attempt=n_try, result="passed", minutes=round(dur / 60, 1), reverted=violations)
             hist = fails.pop(task.id, [])
             if hist or violations:
-                cand_n += record_candidate(a.name, task, tags, lid, "fixed-on-retry" if hist else "passed-with-reverts", n_try, hist, changed, violations)
+                rec = record_candidate(a.name, task, tags, lid, "fixed-on-retry" if hist else "passed-with-reverts", n_try, hist, changed, violations)
+                if rec:
+                    cand_n += 1
+                    run_sigs.add(candidate_signature(rec))
             task_bases.pop(task.id, None)
             idle = 0
         else:
@@ -731,7 +866,10 @@ def main(argv=None):
             fails.setdefault(task.id, []).append({"attempt": n_try, "check": clean(tail(out1, 3), 300), "timed_out": bool(timed_out),
                                                   "reverted": [clean(v, 80) for v in violations[:6]]})
             if final:
-                cand_n += record_candidate(a.name, task, tags, lid, "blocked", n_try, fails.pop(task.id), changed, violations)
+                rec = record_candidate(a.name, task, tags, lid, "blocked", n_try, fails.pop(task.id), changed, violations)
+                if rec:
+                    cand_n += 1
+                    run_sigs.add(candidate_signature(rec))
             if final or a.clean_retry:
                 repo.git("reset", "-q", "--hard", task_base)            # back to where the task started; every attempt is on refs/loop/
                 repo.git("clean", "-fdq")
@@ -765,7 +903,7 @@ def main(argv=None):
     done = [t for t in tasks if t.done]
     lines = [f"# Loop report: {a.name}", "", f"Finished {datetime.datetime.now():%Y-%m-%d %H:%M}. Reason: **{reason}**.",
              f"{len(done)} of {len(tasks)} tasks ticked; {sessions} session(s); {(time.time() - t_start) / 60:.0f} minutes.",
-             f"Lessons in force: {len(picked)} line(s)" + (f", id {lid}" if lid else "") + f". Lesson candidates recorded: {cand_n}.", "",
+             f"Lessons in force: {len(picked)} line(s)" + (f", id {lid}" if lid else "") + f"; left out (did not fit): {len(left_out)}. Lesson candidates recorded: {cand_n}.", "",
              "| Time | Task | Attempt | Result | Minutes | Reverted (outside the task) |", "|---|---|---|---|---|---|"]
     for e in events:
         lines.append(f"| {e['time']} | {e['task']} | {e.get('attempt', '')} | {e['result']} | {e.get('minutes', '')} | {', '.join(e.get('reverted') or []) or '-'} |")
@@ -777,7 +915,9 @@ def main(argv=None):
     say(f"\nLoop finished: {reason}.")
     say(f"{len(done)} of {len(tasks)} tasks ticked in {sessions} session(s). Report: {os.path.join(logs, 'loop-report.md')}")
     if cand_n:
-        say(f"{cand_n} lesson candidate(s) recorded. Read them with:  python3 {os.path.abspath(__file__)} --lessons candidates")
+        repeats = [g for g in candidate_groups(load_candidates()) if g["count"] >= 2 and g["sig"] in run_sigs]
+        say(f"{cand_n} lesson candidate(s) recorded" + (f"; {len(repeats)} of them are problems seen 2 or more times (worth a lesson)" if repeats else "") +
+            f". Read them with:  python3 {os.path.abspath(__file__)} --lessons candidates")
     return 0 if len(done) == len(tasks) else 1
 
 
