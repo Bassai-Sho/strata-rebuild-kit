@@ -1,0 +1,371 @@
+diff --git a/serve/web/app.js b/serve/web/app.js
+index d3ad404..fc095bb 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -281,22 +281,31 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
+   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+   const multi = (hw.gpus || []).length > 1;
++  // Intel xe servers also report the live clock and any throttle reason; other servers leave these unset and the line is unchanged
++  const gpuSub = [st.gpu_name || (st.gpu_note ? "not available" : ""), hw.gpu_clock_mhz != null ? `${fmt(hw.gpu_clock_mhz)} MHz` : "",
++                  hw.gpu_throttle ? `limited: ${hw.gpu_throttle}` : ""].filter(Boolean).join(" · ");
+   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
+-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
++            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : gpuSub);
+   spark("sp-gpu", h.gpu_util, 100);
+-  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
++  // an integrated GPU has no VRAM of its own and the kernel does not report its allocation: show what the engine reports (the expert cache)
++  const vramUsed = hw.gpu_mem_used != null ? hw.gpu_mem_used : (hw.gpu_integrated && eng.expert_cache_mib ? eng.expert_cache_mib * 1048576 : null);
++  setMetric("vram", vramUsed == null ? null : gb(vramUsed), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
+             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
+-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
++                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached${hw.gpu_integrated ? " · shared RAM" : ""}` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
++            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : (hw.gpu_temp_note || ""));
+   spark("sp-temp", h.gpu_temp, 90);
+-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
++  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : (hw.gpu_power_note || ""));
+   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
+   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
+-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
+-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
++  if (hw.gpu_integrated) {     // an iGPU is on the CPU die: there is no PCIe link to report
++    setMetric("pcie", "n/a", "", "integrated GPU · shares system RAM");
++  } else {
++    setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
++              hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
++              (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
++  }
+   spark("sp-pcie", h.gpu_pcie_rx_mb);
+   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+   spark("sp-cpu", h.cpu, 100);
+diff --git a/sycl/serve/test_xe_telemetry.py b/sycl/serve/test_xe_telemetry.py
+new file mode 100644
+index 0000000..de4098b
+--- /dev/null
++++ b/sycl/serve/test_xe_telemetry.py
+@@ -0,0 +1,183 @@
++"""sycl/serve/test_xe_telemetry.py - the Intel readings of xe_telemetry.py against a fake /sys tree (no GPU, no root).
++
++    python3 -m unittest sycl/serve/test_xe_telemetry.py        (from the repo root)
++
++The last test also loads the launcher's own install_xe_reader() (server_intel.py) and builds serve/telemetry.py's
++Telemetry through it, so a change that breaks the shape the launcher installs (gpu_reader(index, amd)) fails here and
++not at server start."""
++import ast
++import json
++import os
++import sys
++import tempfile
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parent.parent))
++sys.path.insert(0, str(HERE))
++
++import xe_telemetry  # noqa: E402
++from serve import telemetry as T  # noqa: E402
++
++
++def put(path, value):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w") as f:
++        f.write(f"{value}\n")
++
++
++def make_card(root, pci="0000:00:02.0", device_id="0x7d55"):
++    dev = os.path.join(root, "devices", "pci0000:00" if pci.split(":")[1] == "00" else "pci0000:00/0000:00:01.0", pci)
++    os.makedirs(os.path.join(root, "class", "drm", "card0"), exist_ok=True)
++    os.makedirs(dev, exist_ok=True)
++    os.symlink(dev, os.path.join(root, "class", "drm", "card0", "device"))
++    put(os.path.join(dev, "vendor"), "0x8086")
++    put(os.path.join(dev, "device"), device_id)
++    gt = os.path.join(dev, "tile0", "gt0")
++    put(os.path.join(gt, "freq0", "act_freq"), 2000)
++    put(os.path.join(gt, "freq0", "rp0_freq"), 2200)
++    put(os.path.join(gt, "freq0", "throttle", "status"), 1)
++    put(os.path.join(gt, "freq0", "throttle", "reason_pl4"), 1)
++    put(os.path.join(gt, "freq0", "throttle", "reason_pl1"), 0)
++    put(os.path.join(gt, "gtidle", "idle_residency_ms"), 10000)
++    put(os.path.join(root, "class", "thermal", "thermal_zone0", "type"), "x86_pkg_temp")
++    put(os.path.join(root, "class", "thermal", "thermal_zone0", "temp"), 91000)
++    return dev, gt
++
++
++class Clock:
++    """time.monotonic as the test sets it: a read asks for the time more than once, so a fixed list would run out."""
++    def __init__(self, t=100.0):
++        self.t = t
++
++    def __call__(self):
++        return self.t
++
++
++class XeFallbacks(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = self.tmp.name
++        self.dev, self.gt = make_card(self.root)
++        self.stat = os.path.join(self.root, "gpustat.json")            # absent unless a test writes it
++        self.patches = [mock.patch.object(xe_telemetry._XeGpu, "SYSFS", self.root), mock.patch.object(xe_telemetry._XeGpu, "STAT", self.stat)]
++        for p in self.patches:
++            p.start()
++
++    def tearDown(self):
++        for p in self.patches:
++            p.stop()
++        self.tmp.cleanup()
++
++    def test_found_named_integrated(self):
++        x = xe_telemetry._XeGpu(0)
++        self.assertTrue(x.ok() and x.integrated)
++        self.assertEqual(x.name(), "Intel Arc Graphics (Meteor Lake)")
++
++    def test_gt_active_time_from_idle_residency(self):
++        x, clk = xe_telemetry._XeGpu(0), Clock(100.0)
++        with mock.patch.object(xe_telemetry.time, "monotonic", clk):
++            self.assertIsNone(x.read()["util"])                         # no interval yet
++            clk.t = 102.0
++            put(os.path.join(self.gt, "gtidle", "idle_residency_ms"), 10800)   # 800 ms idle in 2 s
++            self.assertAlmostEqual(x.read()["util"], 60.0, places=3)
++            clk.t = 103.0
++            put(os.path.join(self.gt, "gtidle", "idle_residency_ms"), 11800)   # idle the whole second
++            self.assertEqual(x.read()["util"], 0.0)
++            clk.t = 104.0
++            put(os.path.join(self.gt, "gtidle", "idle_residency_ms"), 50)      # counter went back: re-seed
++            self.assertIsNone(x.read()["util"])
++
++    def test_without_idle_counter_it_is_awake_or_not(self):
++        os.remove(os.path.join(self.gt, "gtidle", "idle_residency_ms"))
++        r = xe_telemetry._XeGpu(0).read()
++        self.assertEqual(r["util"], 100.0)
++        self.assertIn("coarse", r["util_note"])
++
++    def test_igpu_temperature_clock_throttle_memory(self):
++        r = xe_telemetry._XeGpu(0).read()
++        self.assertEqual((r["temp"], r["clock_mhz"], r["clock_max_mhz"], r["throttle"], r["integrated"]), (91.0, 2000, 2200, "pl4", True))
++        self.assertIn("package", r["temp_note"])
++        self.assertTrue(r["mem_total"] > 1 << 30)
++        self.assertIsNone(r["pcie_gen"])                                # an iGPU has no PCIe link
++
++    def test_not_throttled(self):
++        put(os.path.join(self.gt, "freq0", "throttle", "status"), 0)
++        self.assertEqual(xe_telemetry._XeGpu(0).read()["throttle"], "")
++
++    def test_power_from_rapl_and_when_it_is_root_only(self):
++        rapl = os.path.join(self.root, "class", "powercap", "intel-rapl:0", "energy_uj")
++        x, clk = xe_telemetry._XeGpu(0), Clock(1.0)
++        with mock.patch.object(xe_telemetry.time, "monotonic", clk):
++            self.assertIn("not exposed", x.read()["power_note"])
++            put(rapl, 1000000000)
++            clk.t = 2.0
++            x.read()
++            clk.t = 4.0
++            put(rapl, 1062000000)                                       # 62 J in 2 s
++            r = x.read()
++            self.assertAlmostEqual(r["power"], 31.0, places=3)
++            self.assertIn("RAPL", r["power_note"])
++            if os.geteuid() != 0:
++                os.chmod(rapl, 0)
++                self.assertIn("root only", x.read()["power_note"])
++
++    def test_root_sampler_values_are_never_replaced(self):
++        put(self.stat, json.dumps({"ts": time.time(), "busy_pct": 42.0, "temp_pkg": 50.0, "power_w": 12.5, "vram_used_mb": 100, "vram_total_mb": 200}))
++        r = xe_telemetry._XeGpu(0).read()
++        self.assertEqual((r["util"], r["temp"], r["power"]), (42.0, 50.0, 12.5))
++        self.assertEqual(r["mem_total"], 200 * 2 ** 20)
++        self.assertEqual(r["clock_mhz"], 2000)                          # what the sampler does not have still fills in
++
++    def test_discrete_card_is_not_given_the_cpu_package_readings(self):
++        self.tmp.cleanup()
++        self.tmp = tempfile.TemporaryDirectory()
++        self.root = self.tmp.name
++        for p in self.patches:
++            p.stop()
++        self.dev, self.gt = make_card(self.root, pci="0000:03:00.0", device_id="0xe223")
++        self.patches = [mock.patch.object(xe_telemetry._XeGpu, "SYSFS", self.root), mock.patch.object(xe_telemetry._XeGpu, "STAT", self.stat)]
++        for p in self.patches:
++            p.start()
++        x = xe_telemetry._XeGpu(0)
++        r = x.read()
++        self.assertFalse(x.integrated)
++        self.assertIsNone(r.get("temp"))                                # the CPU package is not the card's temperature
++        self.assertIsNone(r.get("mem_total"))
++        self.assertEqual((r["clock_mhz"], r["throttle"]), (2000, "pl4"))
++        self.assertEqual(x.name(), "Intel Arc Pro B70")
++
++    def test_no_xe_card(self):
++        with tempfile.TemporaryDirectory() as empty, mock.patch.object(xe_telemetry._XeGpu, "SYSFS", empty):
++            self.assertFalse(xe_telemetry._XeGpu(0).ok())
++
++    def test_through_the_launchers_installed_reader(self):
++        """The shape that broke the first attempt: server_intel.install_xe_reader() replaces T.gpu_reader with a version that
++        takes (index, amd).  Its own source is loaded (not the module, which would run the server)."""
++        tree = ast.parse((HERE / "server_intel.py").read_text())
++        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "install_xe_reader")
++        ns = {"T": T, "_XeGpu": xe_telemetry._XeGpu}
++        exec(compile(ast.Module([fn], []), "server_intel.install_xe_reader", "exec"), ns)
++        original = T.gpu_reader
++        try:
++            ns["install_xe_reader"]()
++            tel = T.Telemetry()
++            try:
++                self.assertIsInstance(tel.gpu, xe_telemetry._XeGpu)
++                self.assertEqual(tel.static["gpu_name"], "Intel Arc Graphics (Meteor Lake)")
++                tel.sample()
++                time.sleep(0.05)
++                s = tel.sample()
++                self.assertEqual((s["gpu_temp"], s["gpu_clock_mhz"], s["gpu_throttle"], s["gpu_integrated"]), (91.0, 2000, "pl4", True))
++                self.assertIn("gpu_util", s)
++            finally:
++                tel.close()
++        finally:
++            T.gpu_reader = original
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/sycl/serve/xe_telemetry.py b/sycl/serve/xe_telemetry.py
+index 137667e..ff125c6 100644
+--- a/sycl/serve/xe_telemetry.py
++++ b/sycl/serve/xe_telemetry.py
+@@ -4,6 +4,12 @@ Kept out of serve/telemetry.py so the SYCL port touches no shared file: sycl/ser
+ telemetry.gpu_reader when there is no NVIDIA card.  Load and VRAM need root (xe's only VRAM accounting is per-client
+ fdinfo), so they come from a root sampler's /run/gpustat.json (sycl/tools/gpustat.py); temperature, power and the
+ PCIe link are read from sysfs, so they show without it.
++
++Without the sampler (and on an integrated GPU, which has no hwmon, no VRAM of its own and no PCIe link) the readings
++sysfs gives without root fill in: the GT's active time (the xe_gt_idle residency counter), the package temperature and
++power of an iGPU (it shares the die with the CPU; power only where the kernel lets this user read RAPL), the shared
++system RAM as its memory, and the GT clock with any throttle reason the hardware reports.  `*_note` keys say what a
++number is.  A value the sampler gave is never replaced.
+ """
+ from __future__ import annotations
+ 
+@@ -15,7 +21,8 @@ import time
+ # the cards sycl/setup_intel.py names by PCI id (INTEL_ARC)
+ ARC_NAMES = {"e223": "Arc Pro B70", "e221": "Arc Pro B60", "e211": "Arc Pro B60", "e20b": "Arc B580", "e20c": "Arc B570",
+              "e212": "Arc B50", "56a0": "Arc A770", "56a1": "Arc A750", "56a2": "Arc A580", "56a5": "Arc A380",
+-             "56a6": "Arc A310", "5690": "Arc A770M"}
++             "56a6": "Arc A310", "5690": "Arc A770M", "7d55": "Arc Graphics (Meteor Lake)",
++             "7d45": "Arc Graphics (Meteor Lake)", "64a0": "Arc Graphics 140V (Lunar Lake)"}
+ 
+ 
+ class _XeGpu:
+@@ -23,12 +30,13 @@ class _XeGpu:
+     VRAM accounting xe exposes is per-client fdinfo, readable by root only); temperature, power and the PCIe link are
+     read from sysfs too, so they show without the sampler."""
+     STAT = "/run/gpustat.json"
++    SYSFS = "/sys"
+ 
+     def __init__(self, index=0):
+         import glob
+         self.dev = None
+         cards = []                              # #2001: the Intel cards in sysfs order, as setup numbers them
+-        for d in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
++        for d in sorted(glob.glob(f"{self.SYSFS}/class/drm/card[0-9]*/device")):
+             try:
+                 if open(f"{d}/vendor").read().strip() == "0x8086" and os.path.isdir(f"{d}/tile0"):
+                     cards.append(os.path.realpath(d))
+@@ -40,6 +48,10 @@ class _XeGpu:
+         for n in glob.glob(f"{self.dev}/hwmon/hwmon*/name") if self.dev else []:
+             self.hwmon = os.path.dirname(n)
+         self._e = None                          # (t, card energy uJ) for power without the sampler
++        self.gt = next(iter(sorted(glob.glob(f"{self.dev}/tile*/gt0"))), None) if self.dev else None   # clock, throttle, idle residency
++        self.integrated = bool(self.dev) and os.path.basename(self.dev).split(":")[1:2] == ["00"]    # on PCI bus 0: an iGPU
++        self._idle = None                       # (t, idle residency ms) for the GT's active time without the sampler
++        self._r = None                          # (t, package energy uJ) for an iGPU's power without the sampler
+ 
+     def ok(self):
+         return self.dev is not None and sys.platform.startswith("linux")
+@@ -85,6 +97,75 @@ class _XeGpu:
+                 return g(p, "current"), min(x for x in (card, slot) if x) if (card or slot) else None, w
+         return None, None, None
+ 
++    def _busy(self):
++        """(percent, note): the GT's active time, 100 - the idle (RC6) residency over the interval since the last read
++        (None on the first read); without that counter, 0 or 100 from whether the GT is clocked at all."""
++        v = self._rd(f"{self.gt}/gtidle/idle_residency_ms") if self.gt else None
++        if v is not None and v.isdigit():
++            now, v = time.monotonic(), int(v)
++            prev, self._idle = self._idle, (now, v)
++            if prev is None or now <= prev[0] or v < prev[1]:
++                return None, "GT active time (idle-residency based)"
++            return max(0.0, min(100.0, 100.0 * (1.0 - (v - prev[1]) / ((now - prev[0]) * 1000.0)))), "GT active time (idle-residency based)"
++        a = self._rd(f"{self.gt}/freq0/act_freq") if self.gt else None
++        if a is not None and a.isdigit():
++            return (100.0 if int(a) > 0 else 0.0), "GPU awake (coarse: no idle-residency counter on this kernel)"
++        return None, None
++
++    def _pkg_temp(self):
++        import glob
++        for z in glob.glob(f"{self.SYSFS}/class/thermal/thermal_zone*"):
++            if self._rd(f"{z}/type") == "x86_pkg_temp":
++                t = self._rd(f"{z}/temp")
++                if t and t.lstrip("-").isdigit():
++                    return int(t) / 1000
++        return None
++
++    def _rapl(self):
++        """(watts, note): the CPU + iGPU package's power from RAPL, which the kernel makes root-only by default."""
++        path = f"{self.SYSFS}/class/powercap/intel-rapl:0/energy_uj"
++        e = self._rd(path)
++        if e is None or not e.isdigit():
++            return None, ("package power needs read access to the RAPL counter (root only by default)" if os.path.exists(path)
++                          else "not exposed by this kernel")
++        now, e = time.monotonic(), int(e)
++        prev, self._r = self._r, (now, e)
++        if prev is None or now <= prev[0] or e < prev[1]:
++            return None, "CPU + iGPU package (RAPL)"
++        return (e - prev[1]) / 1e6 / (now - prev[0]), "CPU + iGPU package (RAPL)"
++
++    def _throttle(self):
++        import glob
++        d = f"{self.gt}/freq0/throttle"
++        if self._rd(f"{d}/status") != "1":
++            return ""
++        return " ".join(os.path.basename(f)[len("reason_"):] for f in sorted(glob.glob(f"{d}/reason_*")) if self._rd(f) == "1")
++
++    def _sysfs(self, out):
++        """What sysfs gives without root, for whatever the sampler (or the hwmon) left empty."""
++        out["integrated"] = self.integrated
++        if out.get("util") is None:
++            out["util"], note = self._busy()
++            if note:
++                out["util_note"] = note
++        if self.integrated:
++            if out.get("temp") is None:
++                out["temp"] = self._pkg_temp()
++                out["temp_note"] = "package temperature (the iGPU shares the die with the CPU)"
++            if out.get("power") is None:
++                out["power"], out["power_note"] = self._rapl()
++            if out.get("mem_total") is None:
++                try:                            # no memory of its own: the system RAM it shares
++                    with open("/proc/meminfo") as f:
++                        out["mem_total"] = next(int(x.split()[1]) * 1024 for x in f if x.startswith("MemTotal:"))
++                except (OSError, StopIteration, ValueError, IndexError):
++                    pass
++        if self.gt:
++            a, m = self._rd(f"{self.gt}/freq0/act_freq"), self._rd(f"{self.gt}/freq0/rp0_freq")
++            out["clock_mhz"] = int(a) if a and a.isdigit() else None
++            out["clock_max_mhz"] = int(m) if m and m.isdigit() else None
++            out["throttle"] = self._throttle()
++
+     def read(self):
+         out = {}
+         st = self._stat()
+@@ -114,4 +195,8 @@ class _XeGpu:
+                 out["power_limit"] = int(cap) / 1e6 if cap and cap.isdigit() and int(cap) > 0 else None
+         out["pcie_gen"], out["pcie_gen_max"], out["pcie_width"] = self._link()
+         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None    # xe exposes no PCIe traffic counters
++        try:
++            self._sysfs(out)
++        except Exception:  # noqa: BLE001 - telemetry must never take the server down
++            pass
+         return out

@@ -1,0 +1,193 @@
+diff --git a/sycl/serve/test_xe_telemetry.py b/sycl/serve/test_xe_telemetry.py
+index de4098b..9837e27 100644
+--- a/sycl/serve/test_xe_telemetry.py
++++ b/sycl/serve/test_xe_telemetry.py
+@@ -123,7 +123,24 @@ class XeFallbacks(unittest.TestCase):
+             self.assertIn("RAPL", r["power_note"])
+             if os.geteuid() != 0:
+                 os.chmod(rapl, 0)
+-                self.assertIn("root only", x.read()["power_note"])
++                self.assertIn("root-only", x.read()["power_note"])
++
++    def test_power_from_the_root_sampler_file(self):
++        rapl = os.path.join(self.root, "class", "powercap", "intel-rapl:0", "energy_uj")
++        put(rapl, 1000000000)
++        if os.geteuid() == 0:
++            self.skipTest("root can read the counter itself")
++        os.chmod(rapl, 0)                                               # root-only, as the kernel ships it
++        power = os.path.join(self.root, "power.json")
++        with mock.patch.object(xe_telemetry._XeGpu, "POWER", power):
++            x = xe_telemetry._XeGpu(0)
++            self.assertIsNone(x.read()["power"])                        # no sampler yet
++            put(power, json.dumps({"ts": time.time(), "power_w": 31.4}))
++            r = x.read()
++            self.assertEqual(r["power"], 31.4)
++            self.assertIn("root sampler", r["power_note"])
++            put(power, json.dumps({"ts": time.time() - 60, "power_w": 31.4}))     # a stale file is not believed
++            self.assertIsNone(x.read()["power"])
+ 
+     def test_root_sampler_values_are_never_replaced(self):
+         put(self.stat, json.dumps({"ts": time.time(), "busy_pct": 42.0, "temp_pkg": 50.0, "power_w": 12.5, "vram_used_mb": 100, "vram_total_mb": 200}))
+diff --git a/sycl/serve/xe_telemetry.py b/sycl/serve/xe_telemetry.py
+index ff125c6..a979a16 100644
+--- a/sycl/serve/xe_telemetry.py
++++ b/sycl/serve/xe_telemetry.py
+@@ -31,6 +31,7 @@ class _XeGpu:
+     read from sysfs too, so they show without the sampler."""
+     STAT = "/run/gpustat.json"
+     SYSFS = "/sys"
++    POWER = "/run/strata/power.json"            # package watts from sycl/tools/rapl_power.py, a root service (optional)
+ 
+     def __init__(self, index=0):
+         import glob
+@@ -121,12 +122,28 @@ class _XeGpu:
+                     return int(t) / 1000
+         return None
+ 
++    def _power_file(self):
++        """The watts the root sampler (sycl/tools/rapl_power.py) published, when it is running and fresh."""
++        try:
++            import json
++            with open(self.POWER) as f:
++                p = json.load(f)
++            if time.time() - float(p.get("ts", 0)) < 5 and isinstance(p.get("power_w"), (int, float)):
++                return float(p["power_w"])
++        except (OSError, ValueError, TypeError):
++            pass
++        return None
++
+     def _rapl(self):
+-        """(watts, note): the CPU + iGPU package's power from RAPL, which the kernel makes root-only by default."""
++        """(watts, note): the CPU + iGPU package's power from RAPL.  The kernel makes the counter root-only, so unless it
++        was made readable the figure comes from the root sampler's file (sycl/tools/rapl_power.py)."""
+         path = f"{self.SYSFS}/class/powercap/intel-rapl:0/energy_uj"
+         e = self._rd(path)
+         if e is None or not e.isdigit():
+-            return None, ("package power needs read access to the RAPL counter (root only by default)" if os.path.exists(path)
++            w = self._power_file()
++            if w is not None:
++                return w, "CPU + iGPU package (RAPL, from the root sampler)"
++            return None, ("package power: the RAPL counter is root-only; install sycl/tools/rapl_power.py (see its header)" if os.path.exists(path)
+                           else "not exposed by this kernel")
+         now, e = time.monotonic(), int(e)
+         prev, self._r = self._r, (now, e)
+diff --git a/sycl/tools/rapl_power.py b/sycl/tools/rapl_power.py
+new file mode 100755
+index 0000000..c224b90
+--- /dev/null
++++ b/sycl/tools/rapl_power.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""sycl/tools/rapl_power.py - publishes the CPU + iGPU package power for the Monitor tab, so the raw counter stays root-only.
++
++The kernel makes /sys/class/powercap/intel-rapl:0/energy_uj readable by root only (it is a power side channel: PLATYPUS,
++CVE-2020-8694).  An integrated GPU has no power sensor of its own, so its Monitor card needs the package figure.  This
++small service reads the counter as root once a second and writes only the average watts, to a file anyone may read:
++
++    /run/strata/power.json   {"ts": <unix time>, "power_w": <watts>, "source": "rapl-package"}
++
++sycl/serve/xe_telemetry.py reads that file when it cannot read the counter itself.  A one-second average gives nothing
++the fine-grained counter would: nobody can time individual instructions from it.
++
++Install (as root; a root-owned copy, never a script in a user's home):
++    sudo install -m 755 sycl/tools/rapl_power.py /usr/local/sbin/strata-rapl-power
++    sudo install -m 644 sycl/tools/strata-rapl-power.service /etc/systemd/system/
++    sudo systemctl daemon-reload && sudo systemctl enable --now strata-rapl-power
++Remove:  sudo systemctl disable --now strata-rapl-power && sudo rm /etc/systemd/system/strata-rapl-power.service /usr/local/sbin/strata-rapl-power
++
++  --once   one reading over one second, printed (for a check; needs read access to the counter)
++Environment (for tests): RAPL_ENERGY, RAPL_OUT
++"""
++import json
++import os
++import sys
++import time
++
++ENERGY = os.environ.get("RAPL_ENERGY", "/sys/class/powercap/intel-rapl:0/energy_uj")
++OUT = os.environ.get("RAPL_OUT", "/run/strata/power.json")
++
++
++def read_int(path):
++    try:
++        with open(path) as f:
++            return int(f.read().strip())
++    except (OSError, ValueError):
++        return None
++
++
++def watts(prev, now, wrap):
++    """Average watts between two counter readings (microjoules); None when the counter cannot be compared."""
++    (e0, t0), (e1, t1) = prev, now
++    if t1 <= t0:
++        return None
++    if e1 < e0:                       # the counter wrapped around its range
++        if not wrap:
++            return None
++        e1 += wrap
++    return (e1 - e0) / 1e6 / (t1 - t0)
++
++
++def publish(value):
++    os.makedirs(os.path.dirname(OUT), exist_ok=True)
++    tmp = OUT + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump({"ts": time.time(), "power_w": round(value, 2), "source": "rapl-package"}, f)
++    os.chmod(tmp, 0o644)
++    os.replace(tmp, OUT)              # a reader never sees half a file
++
++
++def main(argv):
++    once = "--once" in argv
++    wrap = read_int(os.path.join(os.path.dirname(ENERGY), "max_energy_range_uj")) or 0
++    prev = None
++    while True:
++        e = read_int(ENERGY)
++        if e is None:
++            sys.exit(f"cannot read {ENERGY}: run as root, or check that this CPU has RAPL")
++        cur = (e, time.monotonic())
++        if prev is not None:
++            w = watts(prev, cur, wrap)
++            if w is not None:
++                if once:
++                    print(f"{w:.2f} W")
++                    return 0
++                publish(w)
++        prev = cur
++        time.sleep(1.0)
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/sycl/tools/strata-rapl-power.service b/sycl/tools/strata-rapl-power.service
+new file mode 100644
+index 0000000..d6b8ecd
+--- /dev/null
++++ b/sycl/tools/strata-rapl-power.service
+@@ -0,0 +1,27 @@
++# Publishes the CPU + iGPU package power (watts) for the Strata Monitor tab; see sycl/tools/rapl_power.py.
++# Install: sudo install -m 755 sycl/tools/rapl_power.py /usr/local/sbin/strata-rapl-power
++#          sudo install -m 644 sycl/tools/strata-rapl-power.service /etc/systemd/system/
++#          sudo systemctl daemon-reload && sudo systemctl enable --now strata-rapl-power
++[Unit]
++Description=Package power for the Strata monitor (reads RAPL as root, publishes watts)
++
++[Service]
++ExecStart=/usr/bin/python3 /usr/local/sbin/strata-rapl-power
++RuntimeDirectory=strata
++RuntimeDirectoryMode=0755
++Restart=on-failure
++RestartSec=5
++# it only reads one sysfs file and writes one file under /run/strata: nothing else
++NoNewPrivileges=yes
++ProtectSystem=strict
++ProtectHome=yes
++PrivateTmp=yes
++PrivateNetwork=yes
++PrivateDevices=yes
++CapabilityBoundingSet=
++RestrictAddressFamilies=AF_UNIX
++MemoryDenyWriteExecute=yes
++LockPersonality=yes
++
++[Install]
++WantedBy=multi-user.target

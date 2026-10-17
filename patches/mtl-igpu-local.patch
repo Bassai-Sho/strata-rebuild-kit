@@ -1,0 +1,75 @@
+diff --git a/sycl/include/dpct/device.hpp b/sycl/include/dpct/device.hpp
+index b55d2dcf..8fd8ddcc 100644
+--- a/sycl/include/dpct/device.hpp
++++ b/sycl/include/dpct/device.hpp
+@@ -345,6 +345,9 @@ static void get_device_info(device_info &out, const sycl::device &dev) {
+   if (dev.has(sycl::aspect::ext_intel_device_id)) {
+     prop.set_device_id(
+         dev.get_info<sycl::ext::intel::info::device::device_id>());
++    // Meteor Lake-P iGPU (PCI 7d55) only: nothing else sets the integrated flag, so device_free_bytes()
++    // (core/expert_cache.cpp) never took its unified-memory branch and read 0 bytes free on this GPU.
++    if ((prop.get_device_id() & 0xffffu) == 0x7d55) prop.set_integrated(1);
+   }
+   if (dev.has(sycl::aspect::ext_intel_device_info_uuid)) {
+     prop.set_uuid(dev.get_info<sycl::ext::intel::info::device::uuid>());
+diff --git a/sycl/setup_intel.py b/sycl/setup_intel.py
+index 8c0ed962..9dc2cc76 100644
+--- a/sycl/setup_intel.py
++++ b/sycl/setup_intel.py
+@@ -52,6 +52,7 @@ INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e221": ("Arc Pro B60", 24.0), "e211
+ # pinned mirror (--mmap-experts + STRATA_VERIFY_NO_HOST=0 - docs/INTEL.md, "Arc A750"). On xe (the A770) the mirror is
+ # built in chunks past that limit and the A-series uses the ordinary streamed path; see to_sycl().
+ ALCHEMIST_IDS = frozenset({"56a0", "56a1", "56a2", "56a5", "56a6", "5690"})
++MTL_IGPU = "7d55"   # Meteor Lake-P iGPU on xe: no VRAM, the GPU shares the RAM. Only this id takes the changes marked MTL.
+ 
+ 
+ def intel_gpus():
+@@ -75,6 +76,8 @@ def intel_gpus():
+             if driver != "xe":                          # i915 without a known Arc id is an integrated GPU
+                 continue
+             name = f"Intel GPU {devid} (xe)"
++        if devid == MTL_IGPU and driver == "xe":        # MTL: BAR 2 is a 256 MB aperture, not memory; the GPU can address ~93% of
++            name, vram = "Arc Graphics (Meteor Lake-P, shared RAM)", max(S.ram_gb() * 0.93 - 12, 0.1)   # the RAM, less 12 for the OS
+         if not vram:                                    # resource line 2 (BAR 2) is the VRAM aperture on xe cards
+             try:
+                 start, end, _ = (dev / "resource").read_text().splitlines()[2].split()
+@@ -172,7 +175,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0,
+         args += ["--kv-resident", "32768"]
+     asked_reserve = flag(args, "--vram-reserve-mib")    # setup writes it only when the user gave it
+     drop(args, "--vram-reserve-mib", True)
+-    reserve = asked_reserve or (str(SMALL_RESERVE_MIB) if small_card(vram_gb, driver) else
++    reserve = asked_reserve or ("2048" if devid == MTL_IGPU else   # MTL: what is allocated after the expert cache
++                                str(SMALL_RESERVE_MIB) if small_card(vram_gb, driver) else
+                                 "1024" if ctx <= 32768 else "2048")
+     alchemist = driver == "i915" or devid in ALCHEMIST_IDS
+     if driver == "i915":
+@@ -183,7 +187,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0,
+         args += ["--vram-reserve-mib", reserve]
+     else:
+         args += ["--stream-experts", "--vram-reserve-mib", reserve]
+-    if ctx > 32768 or vram_gb >= 24:                    # long contexts: 4096-token chunks keep the prompt buffers small; a
++    if ctx > 32768 or (vram_gb >= 24 and devid != MTL_IGPU):                    # long contexts: 4096-token chunks keep the prompt buffers small; a
+         drop(args, "--prefill", True)                   # 24 GB+ card with part of the experts in the RAM mirror streams those
+         args += ["--prefill", "4096"]                   # over PCIe once per chunk, so fewer, bigger chunks read the prompt
+                                                         # faster (Arc Pro B70, IQ3_S, a 4,095-token prompt: 2,048-token
+@@ -200,6 +204,11 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0,
+         # first launch - "'double' is not supported in ... device", the engine dies on the first request with a
+         # temperature - unless the driver emulates it (docs/INTEL.md)
+         env.update({"IGC_EnableDPEmulation": "1", "OverrideDefaultFP64Settings": "1", "NEOReadDebugKeys": "1"})
++    if devid == MTL_IGPU:   # MTL, each measured on this machine (notes: strata-issue-meteorlake.md)
++        env.update({"UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",   # the 33 GiB expert cache is one allocation; the device maximum is 4 GiB
++                    "STRATA_WINDOW_SYNC": "1",                       # without it a window never started, after 3 to 5 requests
++                    "STRATA_UMA_HEADROOM_GIB": "12",                 # the engine's free RAM is MemAvailable less this
++                    "STRATA_MIRROR_MIB": "1024"})                    # no big pinned mirror: the cache holds every expert
+     if exe != ROOT / "build-sycl-aot" / "strata":
+         env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
+     if MOUNT.resolve() != ROOT.parent.resolve():
+@@ -250,7 +259,7 @@ def install(argv) -> None:
+             m = msg.split()[0]
+             d = S.MODELS.get(m, {})
+             shard1 = d.get("download_gb", 0) - 28.8          # all but the per-layer lookup table (read from disk)
+-            room = intel[0]["vram_gb"] - 3 + max(0.0, real_ram - 10)   # VRAM, plus a pinned host mirror (or the CPU)
++            room = intel[0]["vram_gb"] - 3 + (0.0 if intel[0].get("devid") == MTL_IGPU else max(0.0, real_ram - 10))   # VRAM, plus a pinned host mirror (or the CPU); MTL: no mirror
+             msg = (f"  {m:8s} ~{shard1:.0f} GB of weights: " +
+                    ("fits in VRAM" if shard1 <= intel[0]["vram_gb"] - 1.5 else
+                     "fits, the experts the card does not hold are computed on the CPU (slower)" if alch and shard1 <= room else

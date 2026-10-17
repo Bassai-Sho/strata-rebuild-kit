@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# codex: Codex on your local Strata model, in a sandboxed container.
+#
+#   codex                    new project: Codex asks what to build, creates the project folder and its structure
+#   codex "build a snake game"   the same, with your first message already typed
+#   codex NAME               work on the project NAME (created if it does not exist; fresh session, the project's
+#                            PLAN.md and AGENTS.md carry the state)
+#   codex --auto ["idea"]    autopilot: Codex works through the whole plan without waiting for you at each task (also: codex NAME --auto).
+#                            It keeps going until every task is ticked or one is blocked; Esc interrupts. For long runs use codex loop.
+#   codex NAME --spec FILE   copy FILE into the project as SPEC.md (your design), then start: the session plans from it
+#   codex loop NAME          run NAME's PLAN.md unattended: one task per fresh session, the loop runs each check itself
+#                            (options: --sessions N --minutes M --attempts K --hours H --dry-run --yes; codex loop help)
+#   codex gate-test          prove the agent's container can reach only Strata (run once, and after any Docker change)
+#   codex NAME resume        continue the previous conversation in NAME (re-reads the whole history: slower)
+#   codex check NAME         run the project's own check, in a fresh container, and show the result (a test the agent did not run)
+#   codex ls                 list your projects
+#   codex status             is Strata up, is a session running
+#   codex stop               stop Strata when you are done (frees about 40 GB of memory)
+#   codex help
+#
+# Projects live in ~/agent/work/NAME on the host (/work/NAME inside the container). The container sees only that folder.
+set -u
+AGENT="${AGENT_DIR:-$HOME/agent}"
+WORK="$AGENT/work"
+CHOME="$AGENT/codex-home"
+STRATA="${STRATA_DIR:-$HOME/github/strata-work/Strata}"
+URL="${STRATA_URL:-http://127.0.0.1:8085}"
+RUN_SCRIPT="${STRATA_RUN_SCRIPT:-run-swift-iq3_xxs.sh}"
+LOGFILE="${STRATA_LOG:-$STRATA/strata-swift-iq3_xxs.log}"
+SLOTS="${STRATA_EXPECT_SLOTS:-24576}"
+IMAGE="${CODEX_IMAGE:-codex-sandbox}"
+CONTAINER=strata-agent
+PORT="${URL##*:}"; PORT="${PORT%%/*}"
+FRONT_PORT="${CODEX_FRONT_PORT:-8086}"
+SOCK="${CODEX_FRONT_SOCKET:-$AGENT/run/strata-front.sock}"   # the same filter on a Unix socket: the only way out for a container with no network     # strata-front.py: answers Codex's automatic task-title request itself (see that file)
+# The container is the sandbox (Codex's own sandbox cannot run inside Docker), so every command runs without asking:
+# "never" and "on-request" behave the same in this mode, and "never" saves about 900 tokens of prompt.
+# CODEX_APPROVAL=untrusted makes Codex ask before any command that is not on its read-only list.
+APPROVAL="${CODEX_APPROVAL:-never}"
+
+say() { printf '%s\n' "$*"; }
+die() { printf 'codex: %s\n' "$*" >&2; exit 1; }
+up()  { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$URL/v1/models" 2>/dev/null)" = 200 ]; }
+avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }
+
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---- small commands ----------------------------------------------------------------------------------------------------
+list_projects() {
+  [ -d "$WORK" ] || { say "no projects yet: type  codex  to start one"; return; }
+  local n=0 d name done total when
+  while IFS= read -r d; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    done=0; total=0
+    if [ -f "$d/PLAN.md" ]; then done="$(grep -c '^- \[x\]' "$d/PLAN.md" 2>/dev/null || true)"; total=$(( done + $(grep -c '^- \[ \]' "$d/PLAN.md" 2>/dev/null || true) )); fi
+    when="$(date -r "$d" '+%Y-%m-%d %H:%M')"
+    if [ "$total" -gt 0 ]; then printf '  %-24s %s   %s of %s tasks done\n' "$name" "$when" "$done" "$total"; else printf '  %-24s %s\n' "$name" "$when"; fi
+    n=$((n+1))
+  done < <(ls -1dt "$WORK"/*/ 2>/dev/null | sed 's#/$##')
+  [ "$n" -gt 0 ] || say "no projects yet: type  codex  to start one"
+}
+
+status_cmd() {
+  if up; then
+    local last; last="$(grep -E 'expert cache [0-9]+ slots' "$LOGFILE" 2>/dev/null | tail -1 | grep -o '[0-9]* slots' || true)"
+    say "Strata: running on $URL (expert cache: ${last:-unknown})"
+  else say "Strata: not running"; fi
+  if port_open "$FRONT_PORT"; then say "Title filter: running on port $FRONT_PORT"; else say "Title filter: not running (codex starts it when needed)"; fi
+  say "Memory available: $(avail_gib) GiB"
+  if [ -n "$(docker ps --filter "name=^/${CONTAINER}\$" -q 2>/dev/null)" ]; then say "A Codex session is running (docker stop $CONTAINER ends it)"; else say "No Codex session running"; fi
+  say "Projects: $(ls -1d "$WORK"/*/ 2>/dev/null | wc -l) in $WORK"
+}
+
+listener_pids() {   # PIDs of your own processes listening on a port (default: Strata's), read from /proc
+  python3 - "${1:-$PORT}" <<'PY'
+import glob, os, sys
+port = int(sys.argv[1]); inodes = set()
+for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+    try: lines = open(f).read().splitlines()[1:]
+    except OSError: continue
+    for ln in lines:
+        p = ln.split()
+        try:
+            if len(p) > 9 and p[3] == "0A" and int(p[1].split(":")[1], 16) == port: inodes.add(p[9])
+        except ValueError: pass
+pids = set()
+for fd in glob.glob("/proc/[0-9]*/fd/*"):
+    try: link = os.readlink(fd)
+    except OSError: continue
+    if link.startswith("socket:[") and link[8:-1] in inodes: pids.add(fd.split("/")[2])
+print(" ".join(sorted(pids)))
+PY
+}
+
+stop_cmd() {
+  up || { say "Strata is not running."; return 0; }
+  [ -z "$(docker ps --filter "name=^/${CONTAINER}\$" -q 2>/dev/null)" ] || die "a Codex session is still running; leave it first (or: docker stop $CONTAINER)"
+  local pids; pids="$(listener_pids)"
+  say "Stopping Strata (server process: ${pids:-not found}) ..."
+  wait_down() { local i; for i in $(seq 1 "$1"); do up || return 0; sleep "${CODEX_STOP_STEP_S:-2}"; done; ! up; }
+  # the API is served by a host process that starts the engine container as its child: stop the server first, gently, then harder
+  # shellcheck disable=SC2086
+  if [ -n "$pids" ]; then kill -INT $pids 2>/dev/null; wait_down 15 || { kill -TERM $pids 2>/dev/null; wait_down 10; }; fi
+  if up; then for c in $(docker ps --filter ancestor=strata-sycl-dev -q 2>/dev/null); do docker stop -t 30 "$c" >/dev/null 2>&1; done; wait_down 10 || true; fi
+  # shellcheck disable=SC2086
+  if up && [ -n "$pids" ]; then kill -KILL $pids 2>/dev/null; wait_down 5 || true; fi
+  docker rm -f strata-sycl-serve >/dev/null 2>&1 || true      # a stopped leftover would block the next start
+  local fp; fp="$(listener_pids "$FRONT_PORT")"; [ -z "$fp" ] || { kill $fp 2>/dev/null || true; }   # the title filter goes with it
+  rm -f "$SOCK"
+  up && die "Strata would not stop; close the window where it runs (Ctrl+C), or: docker ps"
+  say "Strata stopped. Memory available: $(avail_gib) GiB"
+}
+
+# ---- an independent check of a project ---------------------------------------------------------------------------------------
+check_cmd() {   # runs the project's check command the way you would: new container, no network, nothing the agent left running
+  local name="${1:-}"; [ -n "$name" ] || die "usage: codex check NAME"
+  local d="$WORK/$name"; [ -d "$d" ] || die "no such project: $name   (codex ls)"
+  local cmd=""
+  [ -f "$d/AGENTS.md" ] && cmd="$(sed -n 's/^.*Check command[^:]*: *//p' "$d/AGENTS.md" | head -1 | sed 's/^`//; s/`$//')"
+  { [ -n "$cmd" ] && [ "$cmd" != TO_BE_FILLED_IN ]; } || die "$name has no check command yet (the 'Check command' line in $d/AGENTS.md)"
+  command -v docker >/dev/null || die "docker is not installed"
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "the image $IMAGE is missing"
+  local done=0 total=0
+  if [ -f "$d/PLAN.md" ]; then done="$(grep -c '^- \[x\]' "$d/PLAN.md" 2>/dev/null || true)"; total=$(( done + $(grep -c '^- \[ \]' "$d/PLAN.md" 2>/dev/null || true) )); fi
+  say "Project $name: $done of $total tasks ticked. Last commit: $(git -C "$d" log -1 --format='%s (%cr)' 2>/dev/null || echo none)"
+  say "Running its check in a fresh container (no network): $cmd"; say ""
+  local cargs=(run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/home/agent --memory 4g --memory-swap 4g --cpus 2 --pids-limit 512
+               --cap-drop ALL --security-opt no-new-privileges -v "$WORK:/work" -v "$CHOME:/home/agent/.codex" -w "/work/$name" "$IMAGE" bash -lc "$cmd")
+  if [ "${CODEX_DRY_RUN:-0}" = 1 ]; then printf 'docker'; printf ' %q' "${cargs[@]}"; printf '\n'; return 0; fi
+  docker "${cargs[@]}"; local rc=$?
+  say ""; [ "$rc" = 0 ] && say "The check passed (exit code 0)." || say "The check FAILED (exit code $rc)."
+  ls "$d/artifacts"/*.png >/dev/null 2>&1 && say "Screenshots to look at: $d/artifacts/"
+  return "$rc"
+}
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+ensure_front() {   # Codex's screen sends a second model request per prompt just to invent a title; the filter answers it locally
+  local f="$AGENT/bin/strata-front.py"
+  if [ ! -f "$f" ]; then say "(note: $f is missing, so every prompt also makes Strata write a session title: slower. Run install-codex-client.sh --update)"; FRONT=0; return; fi
+  FRONT=1
+  if port_open "$FRONT_PORT" && [ -S "$SOCK" ]; then return 0; fi
+  if port_open "$FRONT_PORT"; then   # an older filter without the socket: replace it
+    local old; old="$(listener_pids "$FRONT_PORT")"; [ -z "$old" ] || { kill $old 2>/dev/null || true; sleep 1; }
+  fi
+  python3 - "$f" "$FRONT_PORT" "$PORT" "$AGENT/logs/strata-front.log" "$SOCK" <<'PY'
+import os, subprocess, sys
+f, listen, up, log, sock = sys.argv[1:6]
+os.makedirs(os.path.dirname(log), exist_ok=True)
+subprocess.Popen([sys.executable, f, "--listen", listen, "--upstream", f"127.0.0.1:{up}", "--unix", sock], stdin=subprocess.DEVNULL,
+                 stdout=open(log, "ab"), stderr=subprocess.STDOUT, start_new_session=True)
+PY
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do port_open "$FRONT_PORT" && [ -S "$SOCK" ] && return 0; sleep 0.3; done
+  say "(note: the title filter did not start, see $AGENT/logs/strata-front.log; continuing without it: slower)"; FRONT=0
+}
+
+# ---- the unattended loop and its network gate ---------------------------------------------------------------------------------
+loop_cmd() {
+  shift   # "loop"
+  case "${1:-}" in ""|help|-h|--help) python3 "$AGENT/bin/codex-loop.py" --help; return 0 ;; esac
+  [ -f "$AGENT/bin/codex-loop.py" ] || die "codex-loop.py is missing: run  bash ~/strata-rebuild-kit/kit.sh update"
+  local dry=0 a; for a in "$@"; do [ "$a" = "--dry-run" ] && dry=1; done
+  if [ "$dry" = 0 ]; then
+    command -v docker >/dev/null || die "docker is not installed"
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || die "the image $IMAGE is missing"
+    [ -z "$(docker ps --filter "name=^/${CONTAINER}\$" -q 2>/dev/null)" ] || die "an interactive Codex session is running (Strata serves one at a time). End it first"
+    ensure_strata; check_cache; ensure_front
+    [ "${FRONT:-0}" = 1 ] && [ -S "$SOCK" ] || die "the Strata filter and its socket are not available; see $AGENT/logs/strata-front.log"
+    [ "$(avail_gib)" -ge 3 ] || die "only $(avail_gib) GiB of memory available; not starting"
+  fi
+  STRATA_URL="$URL" STRATA_LOG="$LOGFILE" STRATA_EXPECT_SLOTS="$SLOTS" CODEX_FRONT_SOCKET="$SOCK" CODEX_FRONT_PORT="$FRONT_PORT" CODEX_IMAGE="$IMAGE" \
+    exec python3 "$AGENT/bin/codex-loop.py" "$@"
+}
+
+gate_test() {   # the agent's container: can it reach Strata, and nothing else?
+  command -v docker >/dev/null || die "docker is not installed"
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "the image $IMAGE is missing"
+  ensure_strata; ensure_front
+  [ "${FRONT:-0}" = 1 ] && [ -S "$SOCK" ] || die "the Strata filter and its socket are not available"
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  cat > "$tmp/probe.py" <<'PROBE'
+import os, socket, sys, urllib.request
+port = os.environ["FRONT_PORT"]
+bad = [("this machine: Sunshine 47990", "127.0.0.1", 47990), ("this machine: SSH 22", "127.0.0.1", 22),
+       ("this machine: Strata directly 8085", "127.0.0.1", 8085), ("the internet 1.1.1.1:443", "1.1.1.1", 443), ("DNS 8.8.8.8:53", "8.8.8.8", 53)]
+fails = 0
+for name, h, p in bad:
+    try:
+        socket.create_connection((h, p), 2).close()
+        print("REACHABLE (bad): ", name)
+        fails += 1
+    except OSError:
+        print("blocked (good):  ", name)
+try:
+    r = urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=20)
+    print("Strata via the relay:", "HTTP", r.status, "(good)" if r.status == 200 else "(bad)")
+    fails += r.status != 200
+except Exception as e:
+    print("Strata via the relay: FAILED:", e)
+    fails += 1
+print("GATE PASS" if not fails else f"GATE FAIL ({fails} problem(s))")
+sys.exit(1 if fails else 0)
+PROBE
+  chmod -R a+rX "$tmp"
+  local cargs=(run --rm --name strata-gate-test --network none --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges
+               -e "FRONT_PORT=$FRONT_PORT" -v "$SOCK:/run/strata-front.sock" -v "$AGENT/bin/unix-relay.py:/tmp/unix-relay.py:ro" -v "$tmp/probe.py:/tmp/probe.py:ro"
+               "$IMAGE" bash -c 'python3 /tmp/unix-relay.py --listen "$FRONT_PORT" --unix /run/strata-front.sock & for i in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/$FRONT_PORT) 2>/dev/null && break; sleep 0.1; done; exec python3 /tmp/probe.py')
+  if [ "${CODEX_DRY_RUN:-0}" = 1 ]; then printf 'docker'; printf ' %q' "${cargs[@]}"; printf '\n'; return 0; fi
+  docker "${cargs[@]}"
+}
+
+# ---- starting Strata when it is not running ---------------------------------------------------------------------------
+start_detached() {   # in its own session, and with SIGINT NOT ignored (a bash background job starts its children with it ignored,
+                     # and then `codex stop` could not stop the server with Ctrl+C's signal)
+  STRATA_CWD="${STRATA_CWD:-}" python3 - "$@" <<'PY'
+import os, subprocess, sys
+log = open(os.path.expanduser("~/strata-start-swift.log"), "wb")
+env = dict(os.environ, UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS="1", STRATA_WINDOW_SYNC="1", STRATA_ENGINE_STALL_S="900")
+subprocess.Popen(sys.argv[1:], cwd=os.environ.get("STRATA_CWD") or None, env=env, stdin=subprocess.DEVNULL,
+                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+PY
+}
+
+ensure_strata() {
+  up && return 0
+  say "Strata is not running."
+  [ -n "${CODEX_START_CMD:-}" ] || [ -x "$STRATA/$RUN_SCRIPT" ] || die "cannot find $STRATA/$RUN_SCRIPT"
+  if [ "${CODEX_YES:-0}" != 1 ]; then
+    local a; read -r -p "Start it now? It takes about 2 minutes and asks for your sudo password once. [Y/n] " a
+    case "${a:-y}" in [Nn]*) say "Start it with ~/start-swift.sh, then run codex again."; exit 1 ;; esac
+  fi
+  # free the GPU's cached pages first (the same step as ~/start-swift.sh), then start the server in the background
+  if [ -n "${CODEX_DROP_CMD:-}" ]; then sh -c "$CODEX_DROP_CMD"; else sync; echo 2 | sudo tee /proc/sys/vm/drop_caches >/dev/null || die "could not free memory (sudo failed)"; fi
+  sleep "${CODEX_SETTLE:-3}"
+  local av; av="$(avail_gib)"
+  [ "$av" -ge "${CODEX_MIN_AVAIL_GIB:-50}" ] || die "only ${av} GiB of memory available (need about 50+): close other programs and try again"
+  if [ -n "${CODEX_START_CMD:-}" ]; then start_detached sh -c "$CODEX_START_CMD"
+  else STRATA_CWD="$STRATA" start_detached "./$RUN_SCRIPT"; fi
+  printf 'Starting Strata (log: ~/strata-start-swift.log) '
+  local i; for i in $(seq 1 "${CODEX_WAIT_STEPS:-84}"); do up && { printf ' ready\n'; return 0; }; printf '.'; sleep "${CODEX_WAIT_STEP_S:-5}"; done
+  printf '\n'; tail -5 "$HOME/strata-start-swift.log" 2>/dev/null
+  die "Strata did not come up in time; see ~/strata-start-swift.log"
+}
+
+check_cache() {   # batched prompt reading is only safe while every expert is in the GPU cache
+  local last; last="$(grep -E 'expert cache [0-9]+ slots' "$LOGFILE" 2>/dev/null | tail -1 || true)"
+  case "$last" in
+    *"$SLOTS slots"*) ;;
+    *) say "The GPU expert cache is not all-resident (${last:-no cache line found})."
+       say "Restart Strata (codex stop, then codex), or set --short-read 4096 in its config. FORCE=1 codex ... runs anyway."
+       [ "${FORCE:-0}" = 1 ] || exit 1 ;;
+  esac
+}
+
+ensure_trust() {   # Codex asks once per folder whether to trust it; this is your own sandbox, so say yes in advance
+  local cfg="$CHOME/config.toml" p="$1"
+  [ -f "$cfg" ] || return 0
+  grep -qF "[projects.\"$p\"]" "$cfg" || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$p" >> "$cfg"
+}
+
+# ---- main --------------------------------------------------------------------------------------------------------------
+case "${1:-}" in
+  help|-h|--help) usage; exit 0 ;;
+  ls|list)        list_projects; exit 0 ;;
+  status)         status_cmd; exit 0 ;;
+  stop)           stop_cmd; exit 0 ;;
+  check)          shift; check_cmd "${1:-}"; exit $? ;;
+  loop)           loop_cmd "$@"; exit $? ;;
+  gate-test)      gate_test; exit $? ;;
+esac
+
+auto=0; args=(); for a in "$@"; do if [ "$a" = "--auto" ]; then auto=1; else args+=("$a"); fi; done
+set -- "${args[@]+"${args[@]}"}"
+# an option this launcher does not know is an error, never part of the prompt (an older launcher would hand "--auto ..." to Codex as one argument)
+case "${1:-}" in -*) die "unknown option '$1'. If 'codex help' lists it, this command is older than your kit: run  bash ~/strata-rebuild-kit/kit.sh update" ;; esac
+name=""; mode="new"; prompt=""; spec=""
+# several plain words and no such project ("codex build a snake game") are a sentence for a new project, not a project called "build"
+if [ $# -ge 2 ] && [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ ! -d "$WORK/$1" ]; then
+  sentence=1; for w in "${@:2}"; do case "$w" in *" "*|resume|--*) sentence=0 ;; esac; done
+  [ "$sentence" = 1 ] && set -- "$*"
+fi
+if [ $# -ge 1 ]; then
+  if [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    name="$1"; shift; mode="project"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        resume)  mode="resume"; shift ;;
+        --spec)  spec="${2:-}"; [ -n "$spec" ] || die "--spec needs a file"; shift 2 ;;
+        -*)      die "unknown option '$1' (codex help)" ;;
+        *)       break ;;
+      esac
+    done
+    prompt="$*"
+  else
+    prompt="$*"
+  fi
+fi
+
+command -v docker >/dev/null || die "docker is not installed"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || die "the image $IMAGE is missing: run  bash ~/strata-rebuild-kit/agent/strata-agent-setup.sh  first"
+[ -d "$CHOME" ] || die "$CHOME is missing: run  bash ~/strata-rebuild-kit/agent/install-codex-client.sh"
+[ -z "$(docker ps --filter "name=^/${CONTAINER}\$" -q 2>/dev/null)" ] || die "a Codex session is already running (Strata serves one at a time). End it, or: docker stop $CONTAINER"
+
+ensure_strata
+check_cache
+ensure_front
+[ "$(avail_gib)" -ge 3 ] || die "only $(avail_gib) GiB of memory available; not starting"
+
+mkdir -p "$WORK"
+if [ "$mode" = new ]; then wd="/work"; else { [ "${CODEX_DRY_RUN:-0}" = 1 ] || mkdir -p "$WORK/$name"; }; wd="/work/$name"; fi
+if [ -n "$spec" ]; then   # your design goes into the project as SPEC.md (an old, different SPEC.md is kept as SPEC.md.bak)
+  [ -f "$spec" ] || die "no such file: $spec"
+  [ "$mode" = new ] && die "--spec goes with a project name:  codex NAME --spec FILE"
+  if [ -f "$WORK/$name/SPEC.md" ] && ! cmp -s "$spec" "$WORK/$name/SPEC.md"; then cp "$WORK/$name/SPEC.md" "$WORK/$name/SPEC.md.bak"; fi
+  cp "$spec" "$WORK/$name/SPEC.md"; say "Copied $spec to $WORK/$name/SPEC.md"
+fi
+# a project that has your design but no plan yet: start planning by itself, nothing to type
+if [ "$mode" = project ] && [ -z "$prompt" ] && [ ! -f "$WORK/$name/PLAN.md" ] && [ -s "$WORK/$name/SPEC.md" ]; then prompt="Start the project from SPEC.md."; fi
+[ "${CODEX_DRY_RUN:-0}" = 1 ] || { ensure_trust "/work"; [ "$mode" = new ] || ensure_trust "$wd"; }
+before="$(ls -1 "$WORK" 2>/dev/null | sort)"
+
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+cargs=(run --rm --name "$CONTAINER" --network host --user "$(id -u):$(id -g)" -e HOME=/home/agent
+       -e GIT_AUTHOR_NAME=agent -e GIT_AUTHOR_EMAIL=agent@localhost -e GIT_COMMITTER_NAME=agent -e GIT_COMMITTER_EMAIL=agent@localhost
+       --memory 4g --memory-swap 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges
+       -v "$WORK:/work" -v "$CHOME:/home/agent/.codex" -w "$wd" -it "$IMAGE")
+# autopilot: Codex's own goal feature keeps the session going after each turn until the model marks the goal complete or blocked.
+# A start-up prompt cannot be a slash command (it would reach the model as text), so the prompt asks the model to create the goal itself.
+goalflag=()
+if [ "$auto" = 1 ] && [ "$mode" != resume ]; then
+  goalflag=(--enable goals)
+  autotext='Then call create_goal with exactly this objective: "autopilot: finish every unticked task in PLAN.md, in order, in this session. For each: do it, run its check, and when the check prints OK tick it and commit, then start the next one without waiting for me (this overrides one task per session). Never ask me for approval. When every task is ticked call update_goal with status complete. If a check still fails after 3 attempts call update_goal with status blocked and say why."'
+  if [ -z "$prompt" ]; then
+    if [ "$mode" = new ]; then prompt="Start a new project."
+    elif [ -f "$WORK/$name/PLAN.md" ]; then prompt="Continue with PLAN.md."
+    elif [ -s "$WORK/$name/SPEC.md" ]; then prompt="Start the project from SPEC.md."
+    else prompt="Start this project. First ask me what to build."; fi
+  fi
+  prompt="$prompt $autotext"
+  [ "$mode" = new ] && prompt="$prompt (If you must ask me what to build, ask first; the goal starts after the plan is written.)"
+fi
+prov=(); [ "${FRONT:-0}" = 1 ] && prov=(-c 'model_provider="strata_front"')
+if [ "$mode" = resume ]; then
+  codex_cmd=(codex --no-daemon --disable worktrees "${prov[@]}" -s danger-full-access -a "$APPROVAL" resume --last)
+else
+  codex_cmd=(codex --no-daemon --disable worktrees "${goalflag[@]}" "${prov[@]}" -s danger-full-access -a "$APPROVAL")
+  [ -n "$prompt" ] && codex_cmd+=("$prompt")
+fi
+
+if [ "${CODEX_DRY_RUN:-0}" = 1 ]; then printf 'docker'; printf ' %q' "${cargs[@]}" "${codex_cmd[@]}"; printf '\n'; exit 0; fi
+
+if [ "$mode" = new ]; then say "New project. Codex will ask what to build and create the folder under $WORK."
+else say "Project $name ($WORK/$name). Strata is answering; the container sees only $WORK."; fi
+docker "${cargs[@]}" "${codex_cmd[@]}"
+rc=$?
+
+# what happened to the project folders
+after="$(ls -1 "$WORK" 2>/dev/null | sort)"
+created="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tr '\n' ' ')"
+if [ -n "${created// /}" ]; then say ""; say "Created: $created"; say "Continue with:  codex ${created%% *}"; fi
+exit "$rc"
