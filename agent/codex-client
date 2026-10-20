@@ -8,6 +8,8 @@
 #   codex --auto ["idea"]    autopilot: Codex works through the whole plan without waiting for you at each task (also: codex NAME --auto).
 #                            It keeps going until every task is ticked or one is blocked; Esc interrupts. For long runs use codex loop.
 #   codex NAME --spec FILE   copy FILE into the project as SPEC.md (your design), then start: the session plans from it
+#   codex plan [NAME]        plan only: write PLAN.md (or review an existing one) and stop without starting a task. When you leave Codex the plan is
+#                            checked the way codex loop checks it, and you are told what to run next (also: codex plan "idea", codex plan NAME --spec FILE)
 #   codex loop NAME          run NAME's PLAN.md unattended: one task per fresh session, the loop runs each check itself
 #                            (options: --sessions N --minutes M --attempts K --hours H --dry-run --yes; codex loop help)
 #   codex gate-test          prove the agent's container can reach only Strata (run once, and after any Docker change)
@@ -43,7 +45,7 @@ die() { printf 'codex: %s\n' "$*" >&2; exit 1; }
 up()  { [ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$URL/v1/models" 2>/dev/null)" = 200 ]; }
 avail_gib() { awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo; }
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR == 1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"; }
 
 # ---- small commands ----------------------------------------------------------------------------------------------------
 list_projects() {
@@ -210,6 +212,30 @@ PROBE
   docker "${cargs[@]}"
 }
 
+# ---- codex plan: plan only, then check the plan the way the loop will ----------------------------------------------------
+ticked() { local n=0; [ -f "$1/PLAN.md" ] && n="$(grep -c '^- \[x\]' "$1/PLAN.md" 2>/dev/null || true)"; echo "${n:-0}"; }
+
+plan_review() {   # plan_review NAME TICKED_BEFORE: what `codex loop NAME --dry-run` makes of the plan, and what to do next
+  local name="$1" d="$WORK/$1" before="$2" out rc now
+  say ""
+  if [ ! -f "$d/PLAN.md" ]; then say "No PLAN.md was written in $d. Run  codex plan $name  again."; return 0; fi
+  now="$(ticked "$d")"
+  [ "$now" -le "$before" ] || say "Note: the session ticked $((now - before)) task(s) although you asked for plan only. Look at what it did:  git -C $d log --oneline"
+  if [ ! -f "$AGENT/bin/codex-loop.py" ]; then say "(codex-loop.py is missing, so the plan was not checked: run  bash ~/strata-rebuild-kit/kit.sh update)"; return 0; fi
+  say "The plan, as codex loop sees it:"
+  out="$(AGENT_DIR="$AGENT" STRATA_URL="$URL" STRATA_LOG="$LOGFILE" STRATA_EXPECT_SLOTS="$SLOTS" CODEX_FRONT_SOCKET="$SOCK" CODEX_FRONT_PORT="$FRONT_PORT" CODEX_IMAGE="$IMAGE" \
+        python3 "$AGENT/bin/codex-loop.py" "$name" --dry-run 2>&1)"; rc=$?
+  printf '%s\n' "$out" | sed '/^A session would run:/,$d'
+  say ""
+  if [ "$rc" = 0 ]; then
+    say "The loop accepts this plan. Read it (and SPEC.md) first; then:"
+    say "  codex loop $name --sessions 2 --minutes 15      a short first trial (add --allow-new-files if tasks create files they do not list)"
+    say "  codex loop $name                                the real run"
+  else
+    say "The loop would REFUSE this plan (the reason is above). Fix it with  codex plan $name  (the session reviews it with you) or edit $d/PLAN.md."
+  fi
+}
+
 # ---- starting Strata when it is not running ---------------------------------------------------------------------------
 start_detached() {   # in its own session, and with SIGINT NOT ignored (a bash background job starts its children with it ignored,
                      # and then `codex stop` could not stop the server with Ctrl+C's signal)
@@ -270,10 +296,14 @@ case "${1:-}" in
   gate-test)      gate_test; exit $? ;;
 esac
 
+plan=0; if [ "${1:-}" = plan ]; then plan=1; shift; fi     # codex plan [NAME]: the same as codex [NAME], but it stops after the plan is written
 auto=0; args=(); for a in "$@"; do if [ "$a" = "--auto" ]; then auto=1; else args+=("$a"); fi; done
 set -- "${args[@]+"${args[@]}"}"
 # an option this launcher does not know is an error, never part of the prompt (an older launcher would hand "--auto ..." to Codex as one argument)
-case "${1:-}" in -*) die "unknown option '$1'. If 'codex help' lists it, this command is older than your kit: run  bash ~/strata-rebuild-kit/kit.sh update" ;; esac
+case "${1:-}" in
+  --plan) die "plan is a command, not an option:  codex plan NAME" ;;
+  -*)     die "unknown option '$1'. If 'codex help' lists it, this command is older than your kit: run  bash ~/strata-rebuild-kit/kit.sh update" ;;
+esac
 name=""; mode="new"; prompt=""; spec=""
 # several plain words and no such project ("codex build a snake game") are a sentence for a new project, not a project called "build"
 if [ $# -ge 2 ] && [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ ! -d "$WORK/$1" ]; then
@@ -287,6 +317,7 @@ if [ $# -ge 1 ]; then
       case "$1" in
         resume)  mode="resume"; shift ;;
         --spec)  spec="${2:-}"; [ -n "$spec" ] || die "--spec needs a file"; shift 2 ;;
+        --plan)  die "plan is a command, not an option:  codex plan $name" ;;
         -*)      die "unknown option '$1' (codex help)" ;;
         *)       break ;;
       esac
@@ -295,6 +326,11 @@ if [ $# -ge 1 ]; then
   else
     prompt="$*"
   fi
+fi
+
+if [ "$plan" = 1 ]; then
+  [ "$auto" = 0 ] || die "plan and --auto do not go together: codex plan stops after the plan is written, --auto works through it"
+  [ "$mode" != resume ] || die "codex plan starts a planning session; resume continues the previous conversation"
 fi
 
 command -v docker >/dev/null || die "docker is not installed"
@@ -317,6 +353,64 @@ if [ -n "$spec" ]; then   # your design goes into the project as SPEC.md (an old
 fi
 # a project that has your design but no plan yet: start planning by itself, nothing to type
 if [ "$mode" = project ] && [ -z "$prompt" ] && [ ! -f "$WORK/$name/PLAN.md" ] && [ -s "$WORK/$name/SPEC.md" ]; then prompt="Start the project from SPEC.md."; fi
+# the plan-writing guidance: review (D-A-C), feel (UX) and simplicity. Defined once; codex plan always appends it, and a normal session that is about to
+# write a plan gets it too (below). It lives here, not in AGENTS.md, so unattended loop sessions never carry it.
+# the plan review as a compact D-A-C (divergence, adversarial, convergence). CODEX_DAC=0 codex plan ... turns it off. It lives here, not in AGENTS.md,
+# so unattended loop sessions never carry it. It proposes: PLAN.md is never edited by the review (a model that edits its own plan can make it worse).
+dac_text=""
+if [ "${CODEX_DAC:-1}" = 1 ]; then dac_text="$(cat <<'DAC'
+Plan review, D-A-C in two passes (this replaces the Plan review rule in AGENTS.md). Write it to PLAN-REVIEW.md. Do NOT edit PLAN.md.
+Pass 1, broad, under 400 words.
+D, super divergence (no judging, no filtering, wide not deep): give up to ten options for how to build this, one line each of under 20 words, each from a different lens so that no two share a mechanism. 1 Direct: the plan as drafted. 2 Subtractive: the smallest plan that still reaches the goal. 3 Reorder: the riskiest part first, or one thin end-to-end slice first. 4 Another mechanism: a different simple way to build the core (for example DOM instead of canvas, a grid instead of free movement). 5 Reuse: what existing code, file or tool already does part of it. 6 Test first: build the check or a tiny harness before the thing. 7 Person first: what the user does in the first 30 seconds, then shape the tasks around it. 8 Constraint: it must fit one file under 150 lines, or half the tasks. 9 Inversion: start from Acceptance and work backward, or ask what would stop this shipping. 10 Wild: a twist nobody asked for. Ideas, not tasks. Fewer than ten is fine if the rest would be rewordings: never pad. Then mark the two strongest.
+A, adversarial (a reassuring answer counts as a failure): attack the two strongest. 1. Can any check pass without the work, or fail for the wrong reason? 2. Which file or page is missing from files:? 3. Which task needs something a later task makes? 4. Which task is bigger than two files or about 4K tokens of output? 5. Where does it do more than the goal needs: a framework, library, config layer, abstraction, extra file or feature nobody asked for? Name the simpler way. 6. What single observable fact would show it is wrong?
+C, convergence: pick one shape, borrowing good parts from the other options, and list every difference from the drafted PLAN.md as a candidate change: task, change, reason. Keep the best Wild idea as OPTIONAL.
+Pass 2, narrow, under 120 words. Test your own candidates; add no new ones.
+A2, adversarial on the candidates: would each one make the plan worse, bigger or slower for a small local model? Does it rest on something you actually checked? Check what you can with commands: ls the files:, wc -l SPEC.md against each spec: range, and run a task check once and note only its exit code.
+C2, final convergence: keep at most 5 changes, the best-evidenced first, and drop the rest with the reason. For each kept change: task, change, reason, how we would see it was wrong. Mark each claim FACT if you read or ran it this session, GUESS if not. No changes is a valid result: never invent findings.
+DAC
+)"; fi
+# planning for the feel: in the loop a session may only change the files its task lists, so polish and delight must be planned as tasks (or
+# proposals) here, not improvised while building. CODEX_UX=0 codex plan ... turns it off. The model decides whether the project has a user experience.
+ux_text=""
+if [ "${CODEX_UX:-1}" = 1 ]; then ux_text="$(cat <<'UX'
+If a person will see, click or play the result (an interface, page, app or game), the default is a polished result: it works and it feels good. Only if the idea or SPEC.md says wireframe, mockup, basic, rough, prototype, barebones, plain or minimal: plan the plain working version instead, with no Polish tasks and none of points 2 to 5 below.
+1. Self-contained and offline: no CDN links, web fonts, remote images or libraries. Use CSS, canvas, inline SVG and WebAudio.
+2. Polish is planned as real tasks named "Polish: ...": at least one and at most two, before Acceptance, each small (one or two files), each with a check of something observable, never a taste judgement. Check a polish task with the project's browser-check: --expect-text for the exact on-screen words, --expect-motion for a pulse or other animation, --keys for input, --out artifacts to keep a screenshot to look at (browser-check --help lists more). Games: feedback on every action (hit flash, particles, screen shake, a short hit-stop on big hits, easing, squash and stretch, varied sounds), a smooth 60 fps loop, keyboard and touch controls, clear start, pause, win and lose screens, a high score. Interfaces: clear hierarchy, one spacing and type scale, hover, focus and active states, empty, loading and error states, no sideways scroll at 390 px and 1280 px wide, reachable by keyboard.
+3. The look, unless SPEC.md asks for another style: a dark background so glow stands out; a small neon palette of 2 or 3 colours (such as cyan, magenta, yellow); glow on the key elements (layered text-shadow and box-shadow in CSS, shadowBlur with zero offset on canvas); a slow pulse (2 to 6 s, ease-in-out) on the main button or the player; a short flicker or flash on events; particle trails. Text stays readable. Effects are seasoning, scaled to how important the event is; shake the world, not the HUD; keep glow cheap (few animated shadows at once); pulsing, flashing and shaking stop under prefers-reduced-motion.
+4. Retro or arcade projects (the idea or SPEC.md says so): use the genre's own words on screen, in capitals, and write the exact strings into the task lines and into --expect-text checks, so the builders use them. Arcade words: INSERT COIN (blinking with steps() timing) or PRESS START on the title; CREDIT 00; GET READY!; 1UP and HI SCORE labels over the scores; ROUND 2, STAGE CLEAR, BONUS, PERFECT!; GAME OVER, then CONTINUE? counting down 9 to 0; NEW HIGH SCORE, ENTER YOUR INITIALS (3 letters), a top 10 table. Flow: attract mode (title, demo, high scores, repeat), credit, play, game over, initials: fold these states into the Polish tasks. Retro computer or terminal style instead: READY., LOADING..., ENTER COMMAND, PRESS ANY KEY, SYNTAX ERROR. Look: low internal resolution scaled up with pixelated rendering, 8 to 16 colours, monospace capitals with wide letter-spacing (no web fonts), faint scanlines, chiptune from WebAudio square and triangle waves. One voice for every message: no modern wording such as Submit or OK.
+5. Think outside the box in the D step: add one surprising idea nobody asked for (a twist on the mechanic or the interaction) to PLAN-REVIEW.md as an OPTIONAL proposal. Never put it in PLAN.md and never let Acceptance depend on it. The plan stays at 5 to 8 tasks.
+UX
+)"; fi
+# efficiency: every extra line costs generation time on this machine, and every extra file is more for a small model to keep straight.
+simple_text="Keep it simple: the simplest approach that meets the goal wins. Plain HTML, CSS and JS or the standard library before any dependency (there is no network anyway). One file per small thing; split a file only when it passes about 300 lines. No frameworks, config layers, classes, abstractions or features nobody asked for: three similar lines beat a premature helper. Each task is the smallest change that makes its check pass. Simple does not mean plain: unless the idea says wireframe, mockup or basic, Polish still applies, done with cheap tricks (CSS variables, one glow helper, one particle pool), not a library."
+# codex plan: write the plan (or review the existing one) and stop, so you read it before anything is built. Never tells the session to write
+# PLAN.md when one exists: that would replace a plan you may have edited.
+if [ "$plan" = 1 ]; then
+  plan_write="Plan only: write PLAN.md and README.md and the Check command line in AGENTS.md, then do the plan review into PLAN-REVIEW.md, commit all of them, then STOP and wait for me."
+  no_tasks="Do NOT start T1 or any other task: I review the plan first."
+  if [ "$mode" = project ] && [ -f "$WORK/$name/PLAN.md" ]; then
+    if [ -n "$prompt" ]; then :
+    elif [ -n "$dac_text" ]; then prompt="PLAN.md already exists. Read it with SPEC.md and review it. Change nothing except PLAN-REVIEW.md, and commit that file."
+    else prompt="PLAN.md already exists. Read it with SPEC.md and tell me briefly what is wrong or missing: a task without files:, a check that cannot fail, a task that is too big, no acceptance task. Change nothing until I say so."; fi
+  else
+    if [ -n "$prompt" ]; then :
+    elif [ "$mode" = new ]; then prompt="Start a new project."
+    elif [ -s "$WORK/$name/SPEC.md" ]; then prompt="Start the project from SPEC.md."
+    else prompt="Start this project. First ask me what to build."; fi
+    prompt="$prompt $plan_write"
+  fi
+  [ -z "$dac_text" ] || prompt="$prompt $dac_text"
+  [ -z "$ux_text" ] || prompt="$prompt $ux_text"
+  prompt="$prompt $simple_text"
+  prompt="$prompt $no_tasks"
+fi
+# a normal session that is about to write a plan (a new idea, or a project with SPEC.md and no PLAN.md) gets the same guidance. A bare `codex`, which does not
+# know yet what to build, relies on the short fallback in AGENTS.md.
+if [ "$plan" = 0 ] && [ "$mode" != resume ] && [ -n "$prompt" ] && { [ "$mode" = new ] || [ ! -f "$WORK/$name/PLAN.md" ]; }; then
+  [ -z "$dac_text" ] || prompt="$prompt $dac_text"
+  [ -z "$ux_text" ] || prompt="$prompt $ux_text"
+  prompt="$prompt $simple_text"
+fi
 [ "${CODEX_DRY_RUN:-0}" = 1 ] || { ensure_trust "/work"; [ "$mode" = new ] || ensure_trust "$wd"; }
 before="$(ls -1 "$WORK" 2>/dev/null | sort)"
 
@@ -341,10 +435,13 @@ if [ "$auto" = 1 ] && [ "$mode" != resume ]; then
   [ "$mode" = new ] && prompt="$prompt (If you must ask me what to build, ask first; the goal starts after the plan is written.)"
 fi
 prov=(); [ "${FRONT:-0}" = 1 ] && prov=(-c 'model_provider="strata_front"')
+# reasoning level for interactive and plan sessions (none|low|medium|high; CODEX_EFFORT=low codex ... overrides). Set here, not in config.toml, so the
+# unattended loop keeps its own level; a level set at start also avoids the full re-read Strata does when the level changes mid-session.
+eff=(-c "model_reasoning_effort=\"${CODEX_EFFORT:-high}\"")
 if [ "$mode" = resume ]; then
-  codex_cmd=(codex --no-daemon --disable worktrees "${prov[@]}" -s danger-full-access -a "$APPROVAL" resume --last)
+  codex_cmd=(codex --no-daemon --disable worktrees "${prov[@]}" "${eff[@]}" -s danger-full-access -a "$APPROVAL" resume --last)
 else
-  codex_cmd=(codex --no-daemon --disable worktrees "${goalflag[@]}" "${prov[@]}" -s danger-full-access -a "$APPROVAL")
+  codex_cmd=(codex --no-daemon --disable worktrees "${goalflag[@]}" "${prov[@]}" "${eff[@]}" -s danger-full-access -a "$APPROVAL")
   [ -n "$prompt" ] && codex_cmd+=("$prompt")
 fi
 
@@ -352,11 +449,14 @@ if [ "${CODEX_DRY_RUN:-0}" = 1 ]; then printf 'docker'; printf ' %q' "${cargs[@]
 
 if [ "$mode" = new ]; then say "New project. Codex will ask what to build and create the folder under $WORK."
 else say "Project $name ($WORK/$name). Strata is answering; the container sees only $WORK."; fi
+[ "$plan" = 1 ] && say "Plan only: Codex writes PLAN.md and stops. Leave Codex when you have read it; the plan is checked after you leave."
+ticks_before=0; [ "$plan" = 1 ] && [ -n "$name" ] && ticks_before="$(ticked "$WORK/$name")"
 docker "${cargs[@]}" "${codex_cmd[@]}"
 rc=$?
 
 # what happened to the project folders
 after="$(ls -1 "$WORK" 2>/dev/null | sort)"
 created="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tr '\n' ' ')"
-if [ -n "${created// /}" ]; then say ""; say "Created: $created"; say "Continue with:  codex ${created%% *}"; fi
+if [ -n "${created// /}" ]; then say ""; say "Created: $created"; [ "$plan" = 1 ] || say "Continue with:  codex ${created%% *}"; fi
+if [ "$plan" = 1 ]; then target="$name"; [ -n "$target" ] || target="${created%% *}"; [ -z "$target" ] || plan_review "$target" "$ticks_before"; fi
 exit "$rc"

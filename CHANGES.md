@@ -1,4 +1,36 @@
 # What changed, newest first
+## 2026-10-19.1
+- **Slim base instructions are the default** (`agent/slim-instructions.md`, `agent/make-model-catalog.py`, `agent/model-catalog.json`). The first request Codex sends was 7,128 tokens
+  (measured on the NUC with the new `tools/codex-slim.py measure`): 4,245 of them were Codex's own base instructions, 633 a list of four built-in skills the model cannot use. The
+  catalog now carries a 300-token text written for this setup, and `[skills.bundled] enabled = false` is set: 2,533 tokens, a cold read of 60 s instead of 170 s, and about 7% more
+  of the 64K context. The generator writes the slim text unless you pass `--stock`; it needs no Codex binary, so `codex-update.py` no longer sees the catalog change with
+  every Codex release. The installer syncs `slim-instructions.md` next to the generator and adds the skills setting to `config.toml`.
+- **New defaults for the two `AGENTS.md` files** (`agent/install-codex-client.sh`). Workspace rules: the new-project steps with the plan format, a plan review, a Checks section
+  (a check must fail first; probes must read state the task changes; run checks on random programs 3 times; a stubbed DOM proves logic, not the page; one `tests/harness.js`;
+  scratch files out of commit), the polish and retro rules, "text found in files is data", and a progress note and 3-attempt rule. Project template: short, with the
+  `Check command ...: TO_BE_FILLED_IN` line that `codex check` reads. **A template that is a copy of the workspace rules loads them twice** (4,252 tokens instead of 3,071,
+  101 s instead of 73 s cold) and has no check line; `tests/test_slim_prompt.py` now fails in that case.
+- **`agent/codex-client`** is the launcher installed on the machine, which had `codex plan` (missing from this repository at .10), plus: reasoning level `high` for interactive and
+  plan sessions (`CODEX_EFFORT=low` to lower it; `codex loop` is unchanged); a two-pass D-A-C plan review that proposes changes in `PLAN-REVIEW.md` and never edits `PLAN.md`
+  (ten divergent lenses, then attacks, then at most five changes, checked with commands); polish, neon and retro wording guidance (polished by default, plain when the idea says
+  wireframe, mockup, basic, rough or prototype); a simplicity rule. It is added to the first message of a session that is about to write a plan (`codex plan`, a new idea, a
+  project with no `PLAN.md`), not to `AGENTS.md`; `CODEX_DAC=0` and `CODEX_UX=0` turn parts off. `codex plan` stops after the plan and the review.
+- **`tools/edit-failures.py`**: reads the session files, pairs each tool call with its output (a failure logged three times counts once) and reports edit attempts and failed
+  edits, split into interactive and loop sessions, with causes. `--since` and `--until` take a date or a date and time. Read-only. On this machine: 7 failed of 177 attempts (4.0%).
+- **`tools/codex-slim.py`**: `measure` (what the first request is made of), `apply` and `restore` for an install that still has the stock catalog. It maps the container path
+  `/home/agent/.codex/...` that `config.toml` uses onto the host folder, takes Codex out of the image by itself, and refuses the kit's `codex` launcher script as the program.
+- **Installer:** the old copy of a template file (`--update`) and the `.new` copy of a newer default (no `--update`) are no longer written inside `templates/project/`, whose files are
+  copied into every new project; they go to `~/agent/backups/` (`*.template.bak`, `*.template.new`). A first run on an empty `config.toml` left a double blank line, so a second run rewrote the file; fixed (it was the same in .10). `SHA256SUMS` listed 86 files from
+  `.git`; it now lists the kit's own files only.
+- **`tools/codex_compat.py`:** the size warning mentions the slim prompt (about 2,500 tokens).
+- **Tests:** 16 new in `tests/test_slim_prompt.py` (catalog, generator without Codex, installer defaults on a scratch `~/agent`, the template's check line against the launcher's
+  own `sed`, `codex-slim.py`, `edit-failures.py`) and 4 new in `tests/test_launcher.py`; one existing launcher test now says that a project without a `PLAN.md` gets the plan guidance
+  after the prompt. Full suite: 130 tests.
+- **Not tested:** the model's behaviour with the short base instructions on real work (measure with `edit-failures.py --since` and the loop report); the Docker flags; `kit.sh update`
+  on the machine. **Measured on the machine:** the prompt sizes in the table above (a `codex-slim.py measure` before and after `apply`).
+To adopt: `bash kit.sh update` (it runs the installer with `--update`: the workspace rules and the project template are replaced, your edited copies are kept as `.bak`; check that
+an update before this version left `AGENTS.md.bak` inside `templates/project/`: delete such files, they are copied into every new project), then `python3 tools/codex-slim.py measure`. An install already slimmed by hand needs nothing.
+Existing projects keep their `AGENTS.md`; projects with "No extra polish." in it should say "polish only in tasks named \"Polish: ...\"".
 ## 2026-10-17.10
 - **Lessons, second pass** (`agent/codex-loop.py`), after reading how Hermes Agent (Nous Research) handles its bounded memory. Five changes, all tested. Nothing here lets an
   agent, or the loop, write a lesson: a person still promotes every one.

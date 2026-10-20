@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """make-model-catalog.py: write the model catalog that tells Codex what the `strata` model can do.
 
-    python3 make-model-catalog.py --out ~/agent/codex-home/model-catalog.json [--codex-image codex-sandbox | --codex /path/to/codex]
+    python3 make-model-catalog.py --out ~/agent/codex-home/model-catalog.json [--stock [--codex-image codex-sandbox | --codex /path/to/codex]]
 
 Why: Codex only enables its reasoning shortcuts (Alt+. and Alt+,) for a model whose levels it knows, and `strata` is not in its built-in
 list ("Reasoning shortcuts are unavailable for strata"). `model_catalog_json` in config.toml points Codex at a file like this one.
@@ -10,9 +10,10 @@ What it contains: one model, `strata`, with
   * reasoning levels none, low, medium, high: exactly the levels Strata's server accepts (none = thinking off; high = its heaviest, which
     its thinking budget still caps), and `low` as the default;
   * the same tools Codex offers today (tool_mode direct: without it Codex hides every function tool behind a JavaScript sandbox);
-  * Codex's own base instructions for this version, copied from the Codex you point it at, so the prompt does not change.
-The file carries the base instructions of the Codex you point it at, so it is tied to that version. `tools/codex-update.py` runs this for you and only replaces
-the catalog when the new version's base instructions differ (0.162.1 and 0.163.0 are identical).
+  * the kit's SLIM base instructions (`slim-instructions.md`, next to this script, about 300 tokens). Codex's own are about 4,200 tokens that a local model reads
+    at 42 tok/s on every cold start and that describe tools this setup does not have (planning, 17 pages of patch syntax, formatting rules). With `--stock` the
+    catalog instead carries Codex's own base instructions, copied from the Codex you point it at, so it is tied to that version.
+`tools/codex-update.py` runs this for you and only replaces the catalog when the result differs; the slim catalog does not depend on the Codex version.
 """
 import argparse, json, os, subprocess, sys, tempfile
 
@@ -147,20 +148,37 @@ def base_instructions(codex_cmd):
     return text
 
 
+def slim_instructions():
+    """The kit's short base instructions: the file next to this script (also installed next to it in ~/agent/bin)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slim-instructions.md")
+    try:
+        with open(path) as fh:
+            text = fh.read().strip("\n") + "\n"
+    except OSError:
+        raise SystemExit(f"{path} is missing. Install the kit again (bash kit.sh update), or use --stock for Codex's own instructions.")
+    if "coding agent" not in text[:200] or len(text) < 200:
+        raise SystemExit(f"{path} does not look like base instructions")
+    return text
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--stock", action="store_true", help="use Codex's own base instructions (about 4,200 tokens) instead of the kit's slim ones")
     ap.add_argument("--codex", default="", help="path of a codex binary")
     ap.add_argument("--codex-image", default="", help="docker image that has codex (default: codex-sandbox)")
     a = ap.parse_args()
-    cmd = [a.codex] if a.codex else ["docker", "run", "--rm", a.codex_image or "codex-sandbox", "codex"]
     entry = dict(ENTRY)
-    entry["base_instructions"] = base_instructions(cmd)
+    if a.stock:
+        cmd = [a.codex] if a.codex else ["docker", "run", "--rm", a.codex_image or "codex-sandbox", "codex"]
+        entry["base_instructions"] = base_instructions(cmd)
+    else:
+        entry["base_instructions"] = slim_instructions()
     entry["supported_reasoning_levels"] = [{"effort": e, "description": d} for e, d in LEVELS]
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w") as fh:
         json.dump({"models": [entry]}, fh, indent=1)
-    print(f"wrote {a.out}: model strata, levels {[e for e, _ in LEVELS]}, base instructions {len(entry['base_instructions'])} characters")
+    print(f"wrote {a.out}: model strata, levels {[e for e, _ in LEVELS]}, {'stock' if a.stock else 'slim'} base instructions {len(entry['base_instructions'])} characters")
 
 
 if __name__ == "__main__":

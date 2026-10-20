@@ -42,11 +42,44 @@ class Launcher(unittest.TestCase):
             rc, cmd, out = self.run_l(*args); self.assertEqual(rc, 0, out); self.assertIn("-w /work ", cmd)
         self.assertIn("build a snake game", cmd); self.assertNotIn("--enable goals", cmd)
         self.assertEqual(self.folders(), [])                       # a sentence is not a project called "build"; a dry run creates nothing
+    PLAN = "# Plan\n- [ ] T1: a | files: a | check: `x` prints OK\n"
+
     def test_name_and_prompt(self):
-        self.project("mygame")
+        self.project("mygame", PLAN_md=self.PLAN)               # a project that has a plan: the prompt goes through unchanged
         for args in (("mygame", "add", "a", "score"), ("mygame", "add a score")):
             rc, cmd, out = self.run_l(*args); self.assertIn("-w /work/mygame ", cmd); self.assertTrue(cmd.rstrip().endswith("add a score"), cmd)
         rc, cmd, out = self.run_l("mygame", "resume"); self.assertIn("resume --last", cmd)
+    def run_env(self, extra, *args):
+        saved = dict(self.env); self.env.update(extra)
+        try: return self.run_l(*args)
+        finally: self.env = saved
+
+    def test_plan_writing_sessions_get_the_review_guidance_and_others_do_not(self):
+        self.project("planned", PLAN_md=self.PLAN); self.project("fresh")
+        for args in (("planned",), ("planned", "add a score"), ("planned", "resume"), ()):    # a task session, a prompt on a planned project, resume, nothing to build yet
+            self.assertNotIn("two passes", self.run_l(*args)[1], args)
+        for args in (("plan", "planned"), ("build", "a", "snake", "game"), ("fresh", "add a score")):   # a plan is about to be written
+            cmd = self.run_l(*args)[1]
+            for must in ("two passes", "Keep it simple", "PLAN-REVIEW.md"):
+                self.assertIn(must, cmd, args)
+        cmd = self.run_l("fresh", "add a score")[1]
+        self.assertLess(cmd.index("add a score"), cmd.index("two passes"))                    # the person's words come first
+
+    def test_the_guidance_switches(self):
+        cmd = self.run_env({"CODEX_DAC": "0"}, "plan", "fresh")[1]
+        self.assertNotIn("two passes", cmd); self.assertIn("Keep it simple", cmd); self.assertIn("polished result", cmd)
+        cmd = self.run_env({"CODEX_UX": "0"}, "plan", "fresh")[1]
+        self.assertNotIn("polished result", cmd); self.assertIn("two passes", cmd)
+
+    def test_plan_stops_before_the_first_task(self):
+        self.project("planned", PLAN_md=self.PLAN)
+        cmd = self.run_l("plan", "planned")[1]
+        self.assertIn("Do NOT start T1", cmd); self.assertIn("PLAN.md already exists", cmd)
+
+    def test_reasoning_level_is_high_unless_overridden(self):
+        self.assertIn('model_reasoning_effort="high"', self.run_l("planned")[1])
+        self.assertIn('model_reasoning_effort="low"', self.run_env({"CODEX_EFFORT": "low"}, "planned")[1])
+
     def test_auto(self):
         rc, cmd, out = self.run_l("--auto", "build", "a", "snake", "game")
         self.assertIn("--enable goals", cmd); self.assertIn("-w /work ", cmd); self.assertIn("create_goal", cmd); self.assertIn("build a snake game", cmd)

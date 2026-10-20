@@ -1,0 +1,33 @@
+# Environment — never commit credentials
+.env
+kernel.errors.txt
+
+# Generated databases — too large, contain private data
+DATA/
+LOGS/
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+

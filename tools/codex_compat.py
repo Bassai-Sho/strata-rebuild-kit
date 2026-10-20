@@ -264,7 +264,7 @@ def probe_tools(ctx):
     if extra:
         r.warn(f"tools that should be switched off are present: {extra}")
     if ctx.prompt_tokens > 9500:
-        r.warn(f"the prompt is {ctx.prompt_tokens} tokens (it was about 7,200): a cold start reads it at about 42 tok/s")
+        r.warn(f"the prompt is {ctx.prompt_tokens} tokens (about 2,500 with the kit's slim base instructions, about 7,200 with Codex's own): a cold start reads it at about 42 tok/s")
     return r
 
 
