@@ -12,9 +12,22 @@ request itself, instantly (a title made from your first words), and passes every
 (`--network none`): inside, a tiny relay (unix-relay.py) turns it back into 127.0.0.1:8086, so the agent can reach Strata and nothing else:
 not the internet, not your LAN, not Sunshine or Dropbox on this machine.
 
+It also answers Codex's COMPACTION request itself (see synth_compact.py): when the context is full Codex sends the whole history back to ask for a
+summary, which Strata reads from token 0 (47-51K tokens, about 18 minutes, measured). The filter replies at once with a handoff built from PLAN.md,
+progress.txt and the history in the request, and Codex carries on from it. Anything it does not recognise, or cannot build a handoff for, is
+forwarded to Strata as usual. Off switch: an empty file NO-SYNTH-COMPACT in ~/agent/work, or the environment variable STRATA_FRONT_SYNTH=0.
+
 Nothing is stored or logged; it only looks at the request's shape. The `codex` command starts it when needed.
 """
-import argparse, http.client, http.server, json, re, socketserver, sys
+import argparse, http.client, http.server, json, os, re, socketserver, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import synth_compact                    # answers Codex's compaction request at once; the filter works without it
+except Exception:  # noqa: BLE001
+    synth_compact = None
+
+WORK_ROOT = os.path.join(os.environ.get("AGENT_DIR", os.path.expanduser("~/agent")), "work")
 
 TITLE_MARK = "Generate a concise, single-line task title"
 
@@ -43,6 +56,11 @@ def is_title_request(body):
         return (m.group(1) if m else (last if by_meta else "")).strip()
     except Exception:  # noqa: BLE001 - anything unexpected: treat as an ordinary request and forward it
         return None
+
+
+def synth_enabled():
+    return (synth_compact is not None and os.environ.get("STRATA_FRONT_SYNTH") != "0"
+            and not os.path.exists(os.path.join(WORK_ROOT, "NO-SYNTH-COMPACT")))
 
 
 def make_title(prompt):
@@ -118,6 +136,13 @@ class Front(http.server.BaseHTTPRequestHandler):
         prompt = is_title_request(body)
         if prompt is not None:
             return self._title(prompt)
+        if synth_compact is not None and synth_compact.MARK.encode() in body and synth_enabled():
+            try:
+                text = synth_compact.build_handoff(body, WORK_ROOT)
+            except Exception:  # noqa: BLE001 - never let the shortcut break a request: forward it
+                text = None
+            if text:
+                return self._sse(synth_compact.compaction_events(text))
         self._forward(body)
 
     def do_GET(self):

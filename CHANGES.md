@@ -1,4 +1,9 @@
 # What changed, newest first
+## 2026-10-22.1
+- Compaction shortcut: strata-front.py answers Codex's compaction request at once with a handoff built from PLAN.md, progress.txt and the request's history (synth_compact.py); about 18 minutes saved per compaction. Falls back to the model if the request is not recognised. Off switch: ~/agent/work/NO-SYNTH-COMPACT.
+- Start-up read trimmed: slim instructions read open tasks only; the workspace rules no longer tell the model to read AGENTS.md (it is already in the prompt); compact_prompt carries the STRATA-HANDOFF marker; tool output cap 2500; the loop strips WIP: lines once a task passes.
+- Installer: three-way sync (kit-sync.py). Each file is decided by what changed since the last install; live-only changes (the loop's lessons, hotfixes) are copied back into the kit, both-changed files are merged, conflicts change nothing. Default texts moved from heredocs to agent/defaults/. New flags --pull, --no-pull, --only=.
+- codex-stats.py reports where a session's time went and whether compactions were instant.
 ## 2026-10-19.1
 - **Slim base instructions are the default** (`agent/slim-instructions.md`, `agent/make-model-catalog.py`, `agent/model-catalog.json`). The first request Codex sends was 7,128 tokens
   (measured on the NUC with the new `tools/codex-slim.py measure`): 4,245 of them were Codex's own base instructions, 633 a list of four built-in skills the model cannot use. The

@@ -1,0 +1,10 @@
+STRATA-HANDOFF
+Your context is being compacted. Write a handoff note for yourself, under 350 words, in exactly this order. Do not summarise the conversation. Leave out anything finished and verified.
+
+1. TASK: the task and its check command, copied word for word from PLAN.md.
+2. DONE: each file already changed, with the one-line change made. Only changes that were applied.
+3. IN PROGRESS: the patch you were working on. Give the file, the lines to change, and the exact new text you had decided on. If no patch was in progress, write "none".
+4. NEXT: the single next command or patch to run (this is the WIP: PLAN line to write down if it is not yet in progress.txt).
+5. DECIDED: choices already made, each with a few words of reason, so they are not reopened.
+
+After compaction: read progress.txt, then continue from its last WIP: PLAN line that has no WIP: DONE after it. Do not re-plan and do not repeat DECIDED reasoning.

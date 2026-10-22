@@ -646,6 +646,18 @@ def write_plan_tick(proj, task):
         fh.write("\n".join(lines))
 
 
+def strip_wip(proj):
+    """Drop the agent's own `WIP:` checkpoint lines from progress.txt once a task is verified: they only matter while the task is open."""
+    p = os.path.join(proj, "progress.txt")
+    if not os.path.isfile(p):
+        return
+    lines = read_text(p).split("\n")
+    kept = [ln for ln in lines if not ln.startswith("WIP:")]
+    if len(kept) != len(lines):
+        with open(p, "w") as fh:
+            fh.write("\n".join(kept).rstrip("\n") + "\n")
+
+
 def note(proj, text):
     with open(os.path.join(proj, "progress.txt"), "a") as fh:
         fh.write(text.rstrip() + "\n")
@@ -840,6 +852,7 @@ def main(argv=None):
 
         if passed:
             write_plan_tick(proj, task)
+            strip_wip(proj)
             note(proj, f"{task.id} done (attempt {n_try}, {dur / 60:.0f} min, verified by the loop): {task.goal[:80]}")
             repo.git("reset", "-q", "--soft", task_base)               # squash the work-in-progress commits of earlier attempts into one
             repo.git("add", "-A")
