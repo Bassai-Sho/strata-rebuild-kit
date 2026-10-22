@@ -52,6 +52,13 @@ new_tot = sum(a - c for a, c, o, sec in reqs); out_tot = sum(o for a, c, o, sec 
 cold_tok = sum(reqs[i - 1][0] for i in cold_big)
 print(f"\nnewly read tokens {new_tot} (compaction cold reads {cold_tok} = {100*cold_tok//max(new_tot,1)}%) | output tokens {out_tot} (decode about {out_tot/9.5/60:.0f} min)")
 inst = sum(1 for _, a in compactions if a)
+for n, instant in compactions:                                              # what each compaction did to the context and to the next request
+    if 0 < n < len(reqs):
+        b, nx = reqs[n - 1], reqs[n]
+        print(f"  compaction after request {n}: context {b[0]} -> next request {nx[0]} tokens, {nx[1]} of them cached, {nx[3]:.0f} s" + ("" if instant else "  (by the model)"))
 print(f"compactions: {len(compactions)} (instant handoff {inst}, by the model {len(compactions) - inst})" + (f" | slow ones cost about {(cold_tok*0.0206 + 18*len(cold_big))/60:.0f} min of re-reading" if cold_big else ""))
 print(f"\nrequests {len(reqs)} | tool calls {len(outs)} | tool-output tokens {tot} | largest {max((n for n,_ in outs), default=0)} | "
-      f"context at last request {reqs[-1][0] if reqs else 0} | elapsed {sum(r[3] for r in reqs)/60:.1f} min")
+      f"context at last request {reqs[-1][0] if reqs else 0}")
+idle = [r[3] for r in reqs if r[3] > 600]
+print(f"elapsed {sum(r[3] for r in reqs)/60:.0f} min, of which active {sum(r[3] for r in reqs if r[3] <= 600)/60:.0f} min"
+      + (f" ({len(idle)} idle gap{'s' if len(idle) > 1 else ''} over 10 min: {', '.join(f'{g/60:.0f} min' for g in idle)})" if idle else ""))
