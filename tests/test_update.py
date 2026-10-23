@@ -7,6 +7,8 @@ BUILD = ("v=$(grep -m1 -o 'project(strata VERSION [0-9.]*' CMakeLists.txt | grep
 
 DEVICE = "// device.hpp\nint probe() { return 1; }\n// integrated flag helpers\nbool is_integrated() { return false; }\n"
 XE = "# xe_telemetry\ndef read_card():\n    return {}\n"
+SUBTITLE_V2 = "def card_subtitle(card):\n    return [gpu_name(card), clock_text(card), throttle_text(card)]    # the card's second line\n"
+SUBTITLE_QUIET = "def card_subtitle(card):\n    return [gpu_name(card), clock_text(card)]    # the card's second line\n"
 
 def tool(*args, env=None, stdin=""):
     r = subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True, env=env, input=stdin)
@@ -25,14 +27,17 @@ class Update(unittest.TestCase):
         self.write(self.up, "serve/server.py", "print('server 0.1.45')\n"); self.commit_tag("v0.1.45")
         self.write(self.up, "sycl/include/dpct/device.hpp", "// rewritten upstream\nint probe() { return 2; }\n"); self.write(self.up, "CMakeLists.txt", "project(strata VERSION 0.1.46 LANGUAGES CXX)\n")
         self.commit_tag("v0.1.46")                                                       # device.hpp changed: the Meteor Lake patch will not apply
-        # the three kit patches (made against 0.1.44.1)
+        # the four kit patches (made against 0.1.44.1; the last two are made on top of the dashboard patch)
         self.mkpatch("mtl-igpu-local.patch", "sycl/include/dpct/device.hpp", DEVICE, DEVICE + "// MTL: the integrated flag for PCI device 7d55 is set here for the iGPU\n")
-        v2 = XE + "def gt_active_time(card):\n    return read_idle_residency(card) / 1000.0 if card else None\n"
+        v2 = XE + "def gt_active_time(card):\n    return read_idle_residency(card) / 1000.0 if card else None\n" + SUBTITLE_V2
         self.mkpatch("xe-monitor-v2.patch", "sycl/serve/xe_telemetry.py", XE, v2)
-        self.mkpatch("xe-power.patch", "sycl/serve/xe_telemetry.py", v2, v2.replace("else None", "else 0.0") + "def package_power_watts(card):\n    return read_rapl_energy_delta(card) / elapsed_seconds()\n")
+        pw = v2.replace("else None", "else 0.0") + "def package_power_watts(card):\n    return read_rapl_energy_delta(card) / elapsed_seconds()\n"
+        self.mkpatch("xe-power.patch", "sycl/serve/xe_telemetry.py", v2, pw)
+        self.pw = pw; self.quiet = pw.replace(SUBTITLE_V2, SUBTITLE_QUIET)                # the quiet patch drops the throttle entry from the card subtitle
+        self.mkpatch("xe-monitor-quiet.patch", "sycl/serve/xe_telemetry.py", pw, self.quiet)
         # the working copy: 0.1.44.1 with the patches on, an engine, configs and a run script
         subprocess.run(["git", "clone", "-q", self.up, self.ws], check=True); self.git(self.ws, "checkout", "-q", "--detach", "v0.1.44.1")
-        for n in ("mtl-igpu-local.patch", "xe-monitor-v2.patch", "xe-power.patch"): self.git(self.ws, "apply", os.path.join(self.pd, n))
+        for n in ("mtl-igpu-local.patch", "xe-monitor-v2.patch", "xe-power.patch", "xe-monitor-quiet.patch"): self.git(self.ws, "apply", os.path.join(self.pd, n))
         os.makedirs(os.path.join(self.ws, "build-sycl"))
         with open(os.path.join(self.ws, "build-sycl", "strata"), "wb") as fh: fh.write(b"ELF engine=0.1.44.1\0")
         self.write(self.ws, "strata-swift-iq3_xxs.json", json.dumps({"args": ["--prefill", "2048"], "reasoning_budget_tokens": 2048})); self.write(self.ws, "run-swift-iq3_xxs.sh", "#!/bin/sh\n")
@@ -64,7 +69,8 @@ class Update(unittest.TestCase):
         rc, out = self.t("apply", "--to", "v0.1.45", "--yes"); self.assertEqual(rc, 0, out)
         self.assertIn("engine rebuilt: reports 0.1.45", out)
         head = subprocess.run(["git", "-C", self.ws, "describe", "--tags", "--exact-match"], capture_output=True, text=True).stdout.strip(); self.assertEqual(head, "v0.1.45")
-        with open(os.path.join(self.ws, "sycl/serve/xe_telemetry.py")) as fh: self.assertIn("package_power_watts", fh.read())          # the patches are back on
+        with open(os.path.join(self.ws, "sycl/serve/xe_telemetry.py")) as fh: t = fh.read()
+        self.assertIn("package_power_watts", t); self.assertIn("return [gpu_name(card), clock_text(card)]", t); self.assertNotIn("throttle_text", t)          # the patches are back on, the quiet one too
         with open(os.path.join(self.ws, "sycl/include/dpct/device.hpp")) as fh: self.assertIn("MTL: the integrated flag", fh.read())
         self.assertTrue(os.path.exists(os.path.join(self.ws, "run-swift-iq3_xxs.sh")))
         with open(os.path.join(self.ws, "strata-swift-iq3_xxs.json")) as fh: c = json.load(fh)
@@ -106,6 +112,28 @@ class Update(unittest.TestCase):
         b = os.path.join(self.root, "backups"); d = os.path.join(b, [x for x in os.listdir(b) if x.startswith("update-")][0])
         with open(os.path.join(d, "local-changes.diff")) as fh: self.assertIn("my experiment", fh.read())          # saved before it was set aside
         with open(os.path.join(self.ws, "serve/server.py")) as fh: self.assertIn("0.1.45", fh.read())
+    def test_check_lists_all_four_patches_and_they_all_apply_to_the_new_release(self):
+        rc, out = self.t("check", "--to", "v0.1.45", "--no-fetch"); self.assertEqual(rc, 0, out)
+        self.assertIn("Kit patches on your checkout now: mtl-igpu-local.patch, xe-monitor-v2.patch, xe-power.patch, xe-monitor-quiet.patch", out)
+        self.assertRegex(out, r"xe-monitor-quiet\.patch\s+applies cleanly")
+    def test_a_checkout_without_the_quiet_patch_does_not_get_it_from_an_update(self):
+        self.git(self.ws, "apply", "-R", os.path.join(self.pd, "xe-monitor-quiet.patch"))             # the state before this patch existed
+        before = self.snap(); rc, out = self.t("apply", "--to", "v0.1.45", "--yes"); self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.ws, "sycl/serve/xe_telemetry.py")) as fh: t = fh.read()
+        self.assertIn("throttle_text", t); self.assertIn("package_power_watts", t)                    # same set of patches as before the update: an optional patch is never added silently
+        self.assertEqual(self.t("rollback", "--yes")[0], 0); self.assertEqual(self.snap(), before)
+    def test_the_quiet_change_made_by_hand_counts_as_the_patch(self):
+        self.git(self.ws, "apply", "-R", os.path.join(self.pd, "xe-monitor-quiet.patch"))
+        self.write(self.ws, "sycl/serve/xe_telemetry.py", self.quiet)                                 # the same bytes, typed in by hand
+        before = self.snap(); rc, out = self.t("check", "--to", "v0.1.45", "--no-fetch"); self.assertEqual(rc, 0, out); self.assertIn("xe-monitor-quiet.patch", out.split("Kit patches on your checkout now:")[1].splitlines()[0])
+        rc, out = self.t("apply", "--to", "v0.1.45", "--yes"); self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.ws, "sycl/serve/xe_telemetry.py")) as fh: self.assertNotIn("throttle_text", fh.read())
+        self.assertEqual(self.t("rollback", "--yes")[0], 0); self.assertEqual(self.snap(), before)
+    def test_a_hand_edit_that_differs_from_the_patch_stops_the_update_instead_of_being_lost(self):
+        self.git(self.ws, "apply", "-R", os.path.join(self.pd, "xe-monitor-quiet.patch"))
+        self.write(self.ws, "sycl/serve/xe_telemetry.py", self.quiet.replace("clock_text(card)]", "clock_text(card) or '']"))     # close to the patch, not the same
+        before = self.snap(); rc, out = self.t("apply", "--to", "v0.1.45", "--yes"); self.assertEqual(rc, 1, out)
+        self.assertIn("does not explain", out); self.assertIn("Back where you were", out); self.assertEqual(self.snap(), before)         # stopped and undone: the hand edit is still there, byte for byte
     def test_already_at_the_target(self):
         rc, out = self.t("check", "--to", "v0.1.44.1", "--no-fetch"); self.assertIn("Already at v0.1.44.1", out)
 

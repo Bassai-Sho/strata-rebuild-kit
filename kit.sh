@@ -72,12 +72,14 @@ status_cmd() {
     fi
   fi
   say "Meteor Lake patch:      $(patch_state mtl-igpu-local.patch 3)"
-  local dash power
-  dash="$(patch_state xe-monitor-v2.patch 8)"; power="$(patch_state xe-power.patch 8)"
-  # the power patch is made against the dashboard patch's result, so it cannot be applied without it (and it rewrites some of its lines)
+  local dash power quiet
+  dash="$(patch_state xe-monitor-v2.patch 8)"; power="$(patch_state xe-power.patch 8)"; quiet="$(patch_state xe-monitor-quiet.patch 8)"
+  # the power and quiet patches are made against the dashboard patch's result, so neither can be applied without it (and they rewrite some of its lines)
   [ "$power" = applied ] && [ "$dash" != applied ] && dash="applied (the power patch on top of it is applied)"
+  [ "$quiet" = applied ] && [ "$dash" != applied ] && dash="applied (the throttle-note patch on top of it is applied)"
   say "Dashboard readings:     $dash"
   say "Package power:          $power"
+  say "Throttle note hidden:   $quiet"
   say ""
   say "== images =="
   if command -v docker >/dev/null 2>&1; then

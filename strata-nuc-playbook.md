@@ -152,7 +152,7 @@ python3 ~/strata-rebuild-kit/tools/strata-bench2.py run first --runs 5 --prefill
 ```
 Expect decode about 8.6 to 8.7 tok/s and prefill about 42 tok/s on real code (section 7). The first request after a start takes 17 to 18 s while the GPU code compiles.
 
-### Step 8. Monitor patches (optional; the dashboard shows Intel GPU load, temperature, clock and throttle)
+### Step 8. Monitor patches (optional; the dashboard shows Intel GPU load, temperature and clock; an optional last patch hides the throttle note)
 
 ```bash
 cd ~/github/strata-work/Strata
@@ -160,12 +160,13 @@ git apply --check ~/strata-rebuild-kit/patches/xe-monitor-v2.patch && git apply 
 python3 -m unittest sycl/serve/test_xe_telemetry.py                    # Ran 10 tests ... OK
 git apply --check ~/strata-rebuild-kit/patches/xe-power.patch && git apply ~/strata-rebuild-kit/patches/xe-power.patch
 python3 -m unittest sycl/serve/test_xe_telemetry.py                    # Ran 11 tests ... OK
+git apply --check ~/strata-rebuild-kit/patches/xe-monitor-quiet.patch && git apply ~/strata-rebuild-kit/patches/xe-monitor-quiet.patch     # optional: the GPU card's second line stops adding "· limited: pl4"
 sudo install -m 755 sycl/tools/rapl_power.py /usr/local/sbin/strata-rapl-power
 sudo install -m 644 sycl/tools/strata-rapl-power.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now strata-rapl-power
 sleep 3; cat /run/strata/power.json                                    # {"ts": ..., "power_w": ..., "source": "rapl-package"}
 ```
-Restart Strata and hard-refresh the browser (Ctrl+Shift+R). The patches change `sycl/serve/xe_telemetry.py` and `serve/web/app.js` only (power needs the root service; it publishes watts and keeps the raw RAPL counter root-only). Undo: `git apply -R` the patches in reverse order, and disable the service. The unit file has not been checked with `systemd-analyze` yet (section 11, item 4).
+Restart Strata and hard-refresh the browser (Ctrl+Shift+R). The patches change `sycl/serve/xe_telemetry.py` and `serve/web/app.js` only (power needs the root service; it publishes watts and keeps the raw RAPL counter root-only). The quiet patch changes one line of `serve/web/app.js` (the card's subtitle) and nothing else: the server still collects the throttle reason (`gpu_throttle`, also in `strata-recon.sh sample` and `strata-bench2.py`); only the dashboard no longer shows it. If you made that edit by hand, it is the same bytes as the patch, so `kit.sh status` shows it as applied and `strata-update.py` carries it across updates. Undo: `git apply -R` the patches in reverse order (quiet first, then power, then the dashboard patch), and disable the service. The unit file has not been checked with `systemd-analyze` yet (section 11, item 4).
 
 ### Step 9. The `codex` command: Codex on the local model, in a container (optional)
 
@@ -391,7 +392,7 @@ Shell exports (in `start-swift.sh`): `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`,
 | Tool | Use |
 |---|---|
 | `codex-update.py` | `check [--to VER]` (read-only), `apply`, `rollback`: move the Codex in the image to a newer stable release and back, after a 13-probe compatibility suite (`codex_compat.py`, also runnable alone on any binary) (section 9) |
-| `strata-update.py` | `check [--to TAG]` (read-only), `apply --to TAG`, `rollback`: move Strata to a newer release and back, with the three patches, a backup and automatic undo (section 9) |
+| `strata-update.py` | `check [--to TAG]` (read-only), `apply --to TAG`, `rollback`: move Strata to a newer release and back, with the kit's patches, a backup and automatic undo (section 9); the undo puts the files the patches touch back byte for byte, so a hand edit inside one of them survives a stopped update |
 | `strata-models.py` | `list`, `remove TAG [--yes]` (preview first), `show`, `set`, `arg`/`unarg`: see what each model owns, remove one safely, change settings with a backup (Section 9) |
 | `strata-effort-position.py` | `show`, `end`, `start`: makes changing the reasoning level free of re-reading (or undoes it); backup first, restart Strata after |
 | `strata-orchestrator.py` | `plan`, `run` (unattended tuning, about 5 to 6 h), `confirm --combo L1 --pairs 2` (ABBA confirmation, about 2 h), `enginetest`, `canarytest`, `report DIR`, `revert DIR`. It never adopts a result. Run it inside `tmux`; it asks for sudo once (drop_caches and three sysfs settings; model-written canary code runs only in `docker run --network none --read-only`). |
@@ -487,7 +488,7 @@ Full screening of 13 settings and two ABBA confirmations, 16 October. Effects sm
 
 ```bash
 U=~/strata-rebuild-kit/tools/strata-update.py
-python3 $U check                      # READ-ONLY: fetches the tags, and tests your three patches against the newest release in a scratch copy
+python3 $U check                      # READ-ONLY: fetches the tags, and tests your kit patches against the newest release in a scratch copy
 python3 $U check --to v0.1.45         # or a specific release; it lists the SYCL, Intel, server and config commits and the behaviour changes known for your configs
 codex stop
 python3 $U apply --to v0.1.45         # asks you to type the version; then: back up, switch, re-apply the patches, rebuild the engine, kernel tests
@@ -664,6 +665,7 @@ strata-rebuild-kit/
   patches/  mtl-igpu-local.patch    the Meteor Lake patch (device.hpp, setup_intel.py)
             xe-monitor-v2.patch     Intel GPU readings for the dashboard (apply first)
             xe-power.patch          package power via a root sampler (apply second)
+            xe-monitor-quiet.patch  hides the "limited: pl4" note on the GPU card (optional, apply last)
   config/   strata-swift-iq3_xxs.json, start-swift.sh, chat-save.sh, chat-restore.sh, ttm-pool.conf
   tools/    strata-orchestrator.py, strata-bench2.py, strata-recon.sh, strata-tune.py, capture-machine-files.sh, strata-effort-position.py, strata-models.py, strata-update.py, codex-update.py, codex_compat.py
   kit.sh, VERSION, CHANGES.md, README.md   what to do after extracting (kit.sh status / update)

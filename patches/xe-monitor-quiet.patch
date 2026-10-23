@@ -1,0 +1,14 @@
+diff --git a/serve/web/app.js b/serve/web/app.js
+index fc095bb9..2dc67116 100644
+--- a/serve/web/app.js
++++ b/serve/web/app.js
+@@ -282,8 +282,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
+   const multi = (hw.gpus || []).length > 1;
+   // Intel xe servers also report the live clock and any throttle reason; other servers leave these unset and the line is unchanged
+-  const gpuSub = [st.gpu_name || (st.gpu_note ? "not available" : ""), hw.gpu_clock_mhz != null ? `${fmt(hw.gpu_clock_mhz)} MHz` : "",
+-                  hw.gpu_throttle ? `limited: ${hw.gpu_throttle}` : ""].filter(Boolean).join(" · ");
++  const gpuSub = [st.gpu_name || (st.gpu_note ? "not available" : ""), hw.gpu_clock_mhz != null ? `${fmt(hw.gpu_clock_mhz)} MHz` : ""].filter(Boolean).join(" · ");
+   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
+             multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : gpuSub);
+   spark("sp-gpu", h.gpu_util, 100);

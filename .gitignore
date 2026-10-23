@@ -6,6 +6,7 @@ kernel.errors.txt
 DATA/
 LOGS/
 *.db
+machine-snapshot-*/
 
 # Python
 __pycache__/

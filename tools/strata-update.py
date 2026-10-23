@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """strata-update.py: move Strata to a newer release safely, and back again if it is worse. Not pinned to one version.
 
-    python3 strata-update.py check [--to TAG]     READ-ONLY: what a newer release changes, and whether your three patches still apply to it
+    python3 strata-update.py check [--to TAG]     READ-ONLY: what a newer release changes, and whether your kit patches still apply to it
     python3 strata-update.py apply --to TAG       back up, switch to TAG, re-apply the patches, rebuild the engine, test; undoes itself on any failure
     python3 strata-update.py rollback             go back to the version before the last update (engine, code and patches)
         [--strata DIR]      the Strata folder (default ~/github/strata-work/Strata)
@@ -32,7 +32,8 @@ import datetime, glob, json, os, re, shutil, subprocess, sys, tempfile, urllib.r
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STRATA = os.path.expanduser("~/github/strata-work/Strata")
-PATCHES = ["mtl-igpu-local.patch", "xe-monitor-v2.patch", "xe-power.patch"]           # in the order they go on
+PATCHES = ["mtl-igpu-local.patch", "xe-monitor-v2.patch", "xe-power.patch", "xe-monitor-quiet.patch"]           # in the order they go on
+NEEDS = {"xe-power.patch": "xe-monitor-v2.patch", "xe-monitor-quiet.patch": "xe-monitor-v2.patch"}         # a patch made on top of another one implies it
 URL = os.environ.get("STRATA_URL", "http://127.0.0.1:8085")
 BACKUPS = os.path.expanduser(os.environ.get("STRATA_BACKUPS", "~/strata-backups"))
 WATCH = re.compile(r"sycl|intel|\bxe\b|arc |igpu|integrated|\buma\b|meteor|ttm|responses|codex|effort|thinking|reasoning|max_tokens|"
@@ -199,15 +200,16 @@ def applied_ratio(repo, patch):
 
 
 def applied_patches(repo, pdir):
-    """Which kit patches are on this checkout (the power patch needs the dashboard patch, so it implies it)."""
+    """Which kit patches are on this checkout (the power and quiet patches are made on top of the dashboard patch, so each implies it)."""
     names = [n for n in PATCHES if os.path.isfile(os.path.join(pdir, n))]
     on = []
     for n in names:
         hit, tot = applied_ratio(repo, os.path.join(pdir, n))
         if tot and hit * 100 // tot >= 80:
             on.append(n)
-    if "xe-power.patch" in on and "xe-monitor-v2.patch" not in on:
-        on.insert(on.index("xe-power.patch"), "xe-monitor-v2.patch")
+    for n, need in NEEDS.items():                                    # the later patch rewrites lines the earlier one added, so the earlier one may look partly applied
+        if n in on and need not in on and need in names:
+            on.append(need)
     return [n for n in names if n in on]
 
 
@@ -353,8 +355,48 @@ def backup_dir_for(frm, to):
     return os.path.join(BACKUPS, f"update-{frm.rstrip('+')}-to-{to}-{datetime.datetime.now():%Y%m%d-%H%M%S}")
 
 
-def save_backup(repo, bdir, frm, on):
+def kit_patch_files(pdir):
+    """Every file any kit patch touches (the patches may be on, off, or replaced by a hand edit)."""
+    return sorted({f for n in PATCHES if os.path.isfile(os.path.join(pdir, n)) for f in patch_files(os.path.join(pdir, n))[0]})
+
+
+def snapshot_patched_files(repo, bdir, pdir):
+    """Copy the files the patches touch exactly as they are now (hand edits included), so an undo puts back those bytes and not just 'the patches'."""
+    snap, gone = os.path.join(bdir, "patched-files"), []
+    for f in kit_patch_files(pdir):
+        src = os.path.join(repo, f)
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(os.path.join(snap, f)), exist_ok=True)
+            shutil.copy2(src, os.path.join(snap, f))
+        else:
+            gone.append(f)                                       # a file a patch creates and that is not there yet
+    with open(os.path.join(bdir, "patched-files.json"), "w") as fh:
+        json.dump({"absent": gone}, fh)
+
+
+def restore_patched_files(repo, bdir):
+    """The undo's last step: the patched files go back byte for byte. Older backups have no snapshot; nothing is done for them."""
+    try:
+        with open(os.path.join(bdir, "patched-files.json")) as fh:
+            absent = json.load(fh)["absent"]
+    except (OSError, ValueError, KeyError):
+        return
+    snap = os.path.join(bdir, "patched-files")
+    for root, _, files in os.walk(snap):
+        for name in files:
+            src = os.path.join(root, name)
+            dst = os.path.join(repo, os.path.relpath(src, snap))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    for f in absent:
+        if os.path.isfile(os.path.join(repo, f)):
+            os.unlink(os.path.join(repo, f))
+
+
+def save_backup(repo, bdir, frm, on, pdir=None):
     os.makedirs(bdir, exist_ok=True)
+    if pdir:
+        snapshot_patched_files(repo, bdir, pdir)
     for pat in ("strata-*.json", "run-*.sh"):
         for f in glob.glob(os.path.join(repo, pat)):
             shutil.copy2(f, bdir)
@@ -444,7 +486,7 @@ def cmd_apply(repo, pdir, to, yes, force, skip_build, skip_tests, no_compat=Fals
     if not yes and input(f"Type the version ({to}) to go ahead: ").strip() != to:
         say("Not confirmed. Nothing was changed."); return 1
     bdir = backup_dir_for(frm, to)
-    state = save_backup(repo, bdir, frm, on)
+    state = save_backup(repo, bdir, frm, on, pdir)
     state["to"] = to
     save_state(bdir, state)
     say(f"\n1. backed up to {bdir}")
@@ -495,6 +537,7 @@ def undo(repo, pdir, state, bdir, force):
     cur_on = applied_patches(repo, pdir)
     reverse_patches(repo, pdir, cur_on, force)
     checkout_back(repo, state, pdir)
+    restore_patched_files(repo, bdir)
     eng = os.path.join(bdir, f"strata-engine-{state.get('engine') or 'unknown'}")
     if os.path.isfile(eng):
         os.makedirs(os.path.join(repo, "build-sycl"), exist_ok=True)
