@@ -22,12 +22,12 @@ class SlimCatalog(unittest.TestCase):
         model = json.loads(read("agent", "model-catalog.json"))["models"][0]
         slim = read("agent", "slim-instructions.md")
         self.assertEqual(model["base_instructions"].strip(), slim.strip())
-        self.assertTrue(model["base_instructions"].startswith("You are a coding agent running in the Codex CLI"))
+        self.assertTrue(model["base_instructions"].startswith("You are a coding agent in the Codex CLI"))
         self.assertLess(len(model["base_instructions"]), 2000)             # about 500 tokens: Codex's own are about 4,200
 
     def test_slim_text_keeps_what_the_session_needs(self):
         slim = read("agent", "slim-instructions.md")
-        for must in ("exec_command", "apply_patch", "*** End Patch", "check", "AGENTS.md", "PLAN.md", "on its own"):
+        for must in ("exec_command", "apply_patch", "*** End Patch", "check", "AGENTS.md", "PLAN.md", "Never say a task is done before its check passes"):
             self.assertIn(must, slim)
         self.assertNotIn("request_user_input", slim)                        # the workspace rules already forbid it; one source
 
@@ -50,9 +50,8 @@ class SlimCatalog(unittest.TestCase):
             self.assertIn("--stock", r.stdout + r.stderr)
 
     def test_the_tool_carries_the_same_text(self):
-        tool = read("tools", "codex-slim.py")
-        m = re.search(r'SLIM = """(.*?)"""\n', tool, re.S)
-        self.assertEqual(m.group(1).strip(), read("agent", "slim-instructions.md").strip())
+        tool = load(os.path.join(KIT, "tools", "codex-slim.py"), "codex_slim")              # the real string the tool would write, escapes resolved
+        self.assertEqual(tool.SLIM.strip(), read("agent", "slim-instructions.md").strip())
 
 
 class InstallerDefaults(unittest.TestCase):
@@ -67,9 +66,14 @@ class InstallerDefaults(unittest.TestCase):
             fh.write("#!/bin/sh\nexit 1\n")
         os.chmod(os.path.join(fake, "docker"), 0o755)
         self.env = dict(os.environ, AGENT_DIR=self.agent, HOME=self.home, PATH=fake + os.pathsep + os.environ["PATH"])
+        # The installer pulls a change found only in ~/agent back INTO the kit it runs from (kit-sync.py). Run it from a scratch copy, never from the
+        # real kit: these tests write edits to the rules, and used to leave "an edit" and "my own rule" in the kit's own agent/defaults.
+        self.kit = os.path.join(self.d, "kit")
+        shutil.copytree(KIT, self.kit, ignore=shutil.ignore_patterns(".git", "__pycache__", "machine-snapshot-*", "*.tar.gz"))
+        self.installer = os.path.join(self.kit, "agent", "install-codex-client.sh")
 
     def run_installer(self, *args):
-        return subprocess.run(["bash", INSTALLER, *args], capture_output=True, text=True, env=self.env)
+        return subprocess.run(["bash", self.installer, *args], capture_output=True, text=True, env=self.env)
 
     def cat(self, *p):
         with open(os.path.join(self.agent, *p)) as fh:
@@ -83,7 +87,7 @@ class InstallerDefaults(unittest.TestCase):
         self.assertIn("Then stop.", ws)
         self.assertTrue(tpl.startswith("# Project rules"))                     # the template must NOT be the workspace rules (it is copied into every new project)
         self.assertNotIn("## Plan review", tpl); self.assertNotIn("## New project", tpl)
-        self.assertLess(len(tpl), 1200)                                        # short: it is loaded next to the workspace rules in every session
+        self.assertLess(len(tpl), 4000)                                        # short: it is loaded next to the workspace rules in every session (it was 3,605 characters on 2026-10-23; the old bound of 1,200 was passed by promoted lessons)
 
     def test_template_check_line_is_what_codex_check_reads(self):
         self.run_installer()
@@ -113,34 +117,39 @@ class InstallerDefaults(unittest.TestCase):
         chk = self.run_installer("--check")
         self.assertNotIn("UPDATE", chk.stdout.replace("--update", ""), chk.stdout)   # the read-only check finds nothing to update
 
-    def test_an_edited_workspace_file_is_kept_unless_update(self):
+    def kit_file(self, *p):
+        with open(os.path.join(self.kit, *p)) as fh:
+            return fh.read()
+
+    def test_an_edited_workspace_file_is_kept_and_pulled_into_the_kit(self):
         self.run_installer()
         path = os.path.join(self.agent, "codex-home", "AGENTS.md")
         with open(path, "a") as fh:
             fh.write("my own rule\n")
         r = self.run_installer()
-        self.assertIn("kept your edited", r.stdout)
+        self.assertIn("pulled:", r.stdout)                                      # a change found only on the machine goes into the kit it runs from
         self.assertIn("my own rule", self.cat("codex-home", "AGENTS.md"))
-        r = self.run_installer("--update")
-        self.assertNotIn("my own rule", self.cat("codex-home", "AGENTS.md"))
-        self.assertTrue(os.path.isfile(path + ".bak"))                          # the edited copy is kept
+        self.assertIn("my own rule", self.kit_file("agent", "defaults", "workspace-AGENTS.md"))
+        self.assertNotIn("my own rule", read("agent", "defaults", "workspace-AGENTS.md"))   # ... the scratch kit, not the real one
+        self.run_installer("--update")
+        self.assertIn("my own rule", self.cat("codex-home", "AGENTS.md"))       # --update has nothing to replace: the kit now agrees with the machine
+        saved = os.listdir(os.path.join(self.agent, "backups"))
+        self.assertTrue([f for f in saved if f.endswith(".kit-bak")], saved)    # the kit's old copy was saved first
 
     def test_template_backups_never_land_inside_the_template_folder(self):
         self.run_installer()
         tpl = os.path.join(self.agent, "codex-home", "templates", "project", "AGENTS.md")
         with open(tpl, "a") as fh:
             fh.write("an edit\n")
-        r = self.run_installer()                                               # kept: the newer default goes beside the backups, not into the template
-        self.assertIn("kept your edited", r.stdout)
-        r = self.run_installer("--update")
-        self.assertIn("updated:", r.stdout)
-        inside = [f for f in os.listdir(os.path.dirname(tpl)) if f.endswith((".bak", ".new"))]
+        r = self.run_installer()
+        self.assertIn("pulled:", r.stdout)
+        self.run_installer("--update")
+        inside = [f for f in os.listdir(os.path.dirname(tpl)) if f.endswith((".bak", ".new", ".kit-bak"))]
         self.assertEqual(inside, [], inside)                                   # cp -r of this folder would copy them into every new project
         saved = os.listdir(os.path.join(self.agent, "backups"))
-        self.assertTrue([f for f in saved if f.endswith(".template.bak")], saved)
-        self.assertTrue([f for f in saved if f.endswith(".template.new")], saved)
-        with open(os.path.join(self.agent, "backups", [f for f in saved if f.endswith(".template.bak")][0])) as fh:
-            self.assertIn("an edit", fh.read())                                # the edited copy is what was saved
+        self.assertTrue([f for f in saved if f.endswith(".kit-bak")], saved)
+        self.assertIn("an edit", self.kit_file("agent", "defaults", "project-AGENTS.md"))
+        self.assertIn("an edit", self.cat("codex-home", "templates", "project", "AGENTS.md"))
 
     def test_config_keeps_an_existing_skills_table_and_other_settings(self):
         with open(os.path.join(self.agent, "codex-home", "config.toml"), "w") as fh:

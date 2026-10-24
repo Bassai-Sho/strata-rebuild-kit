@@ -17,6 +17,10 @@ summary, which Strata reads from token 0 (47-51K tokens, about 18 minutes, measu
 progress.txt and the history in the request, and Codex carries on from it. Anything it does not recognise, or cannot build a handoff for, is
 forwarded to Strata as usual. Off switch: an empty file NO-SYNTH-COMPACT in ~/agent/work, or the environment variable STRATA_FRONT_SYNTH=0.
 
+On the way back it also repairs one thing (apply_patch_rescue.py): when the model writes `apply_patch` as if it were a tool, Strata returns the text
+and Codex ends the turn; the filter adds a real exec_command call so the turn goes on. Off switch: an empty file NO-APPLY-PATCH-RESCUE in
+~/agent/work, or STRATA_FRONT_APPLY_PATCH=0. Everything else in a response passes through byte for byte.
+
 Nothing is stored or logged; it only looks at the request's shape. The `codex` command starts it when needed.
 """
 import argparse, http.client, http.server, json, os, re, socketserver, sys
@@ -26,6 +30,10 @@ try:
     import synth_compact                    # answers Codex's compaction request at once; the filter works without it
 except Exception:  # noqa: BLE001
     synth_compact = None
+try:
+    import apply_patch_rescue               # turns an apply_patch call written as text into a real call; the filter works without it
+except Exception:  # noqa: BLE001
+    apply_patch_rescue = None
 
 WORK_ROOT = os.path.join(os.environ.get("AGENT_DIR", os.path.expanduser("~/agent")), "work")
 
@@ -61,6 +69,11 @@ def is_title_request(body):
 def synth_enabled():
     return (synth_compact is not None and os.environ.get("STRATA_FRONT_SYNTH") != "0"
             and not os.path.exists(os.path.join(WORK_ROOT, "NO-SYNTH-COMPACT")))
+
+
+def rescue_enabled():
+    return (apply_patch_rescue is not None and os.environ.get("STRATA_FRONT_APPLY_PATCH") != "0"
+            and not os.path.exists(os.path.join(WORK_ROOT, "NO-APPLY-PATCH-RESCUE")))
 
 
 def make_title(prompt):
@@ -118,13 +131,23 @@ class Front(http.server.BaseHTTPRequestHandler):
                 self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
+        fix = None                                                                  # apply_patch_rescue.py: only a streamed Responses reply is looked at
+        if self.command == "POST" and "text/event-stream" in (resp.getheader("Content-Type") or "") and self.path.split("?")[0].rstrip("/").endswith("/responses") and rescue_enabled():
+            fix = apply_patch_rescue.Stream()
         try:
             while True:
                 chunk = resp.read1(65536)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                out = fix.feed(chunk) if fix else chunk
+                if out:
+                    self.wfile.write(out)
+                    self.wfile.flush()
+            if fix:
+                tail = fix.finish()
+                if tail:
+                    self.wfile.write(tail)
+                    self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass                                                                    # Codex went away (Esc, or closed): drop the upstream request too
         finally:

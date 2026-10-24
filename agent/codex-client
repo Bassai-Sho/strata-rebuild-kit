@@ -138,11 +138,34 @@ check_cmd() {   # runs the project's check command the way you would: new contai
 
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
+front_is_stale() {   # 0 when the running filter started before one of its files was installed, and no session is using it
+  if command -v docker >/dev/null 2>&1 && [ -n "$(docker ps --filter "name=^/${CONTAINER}\$" -q 2>/dev/null)" ]; then return 1; fi
+  local pids; pids="$(listener_pids "$FRONT_PORT")"; [ -n "$pids" ] || return 1
+  python3 - "$AGENT/bin" $pids <<'PY'
+import os, sys
+bindir, pids = sys.argv[1], sys.argv[2:]
+try:
+    btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime"))
+    newest = max(os.path.getmtime(os.path.join(bindir, f)) for f in ("strata-front.py", "apply_patch_rescue.py", "synth_compact.py") if os.path.exists(os.path.join(bindir, f)))
+    for pid in pids:
+        ticks = int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19])
+        if newest > btime + ticks / os.sysconf("SC_CLK_TCK") + 1:
+            sys.exit(0)
+except Exception:   # anything unexpected: leave the filter alone
+    pass
+sys.exit(1)
+PY
+}
+
 ensure_front() {   # Codex's screen sends a second model request per prompt just to invent a title; the filter answers it locally
   local f="$AGENT/bin/strata-front.py"
   if [ ! -f "$f" ]; then say "(note: $f is missing, so every prompt also makes Strata write a session title: slower. Run install-codex-client.sh --update)"; FRONT=0; return; fi
   FRONT=1
-  if port_open "$FRONT_PORT" && [ -S "$SOCK" ]; then return 0; fi
+  if port_open "$FRONT_PORT" && [ -S "$SOCK" ]; then
+    front_is_stale || return 0                      # a filter keeps the code it started with: after an update, replace it
+    local old; old="$(listener_pids "$FRONT_PORT")"; [ -z "$old" ] || { kill $old 2>/dev/null || true; sleep 1; }
+    say "(the title filter was older than its installed files: restarted it)"
+  fi
   if port_open "$FRONT_PORT"; then   # an older filter without the socket: replace it
     local old; old="$(listener_pids "$FRONT_PORT")"; [ -z "$old" ] || { kill $old 2>/dev/null || true; sleep 1; }
   fi

@@ -27,7 +27,7 @@ class Synth(unittest.TestCase):
         cls.port = cls.srv.server_address[1]
     @classmethod
     def tearDownClass(cls):
-        cls.srv.shutdown(); cls.up.shutdown()
+        cls.srv.shutdown(); cls.up.shutdown(); cls.srv.server_close(); cls.up.server_close()
     def setUp(self):
         Upstream.seen.clear(); self.tmp = tempfile.mkdtemp(); front.WORK_ROOT = os.path.join(self.tmp, "work"); proj = os.path.join(front.WORK_ROOT, "demo"); os.makedirs(proj)
         with open(os.path.join(proj, "PLAN.md"), "w") as fh: fh.write("- [ ] T1: build it | files: a.js | check: `node a.js`\n")

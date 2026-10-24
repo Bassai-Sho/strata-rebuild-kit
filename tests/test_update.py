@@ -6,6 +6,7 @@ BUILD = ("v=$(grep -m1 -o 'project(strata VERSION [0-9.]*' CMakeLists.txt | grep
          "printf \"ELF engine=$v\\0\" > build-sycl/strata; echo BUILD EXIT 0")
 
 DEVICE = "// device.hpp\nint probe() { return 1; }\n// integrated flag helpers\nbool is_integrated() { return false; }\n"
+DEVICE_02 = "// device.hpp\nint probe() { return 2; }\n// integrated flag helpers\nbool is_integrated() { return false; }\n"      # the 0.2 line: the same code, a line near the patch rewritten
 XE = "# xe_telemetry\ndef read_card():\n    return {}\n"
 SUBTITLE_V2 = "def card_subtitle(card):\n    return [gpu_name(card), clock_text(card), throttle_text(card)]    # the card's second line\n"
 SUBTITLE_QUIET = "def card_subtitle(card):\n    return [gpu_name(card), clock_text(card)]    # the card's second line\n"
@@ -27,12 +28,15 @@ class Update(unittest.TestCase):
         self.write(self.up, "serve/server.py", "print('server 0.1.45')\n"); self.commit_tag("v0.1.45")
         self.write(self.up, "sycl/include/dpct/device.hpp", "// rewritten upstream\nint probe() { return 2; }\n"); self.write(self.up, "CMakeLists.txt", "project(strata VERSION 0.1.46 LANGUAGES CXX)\n")
         self.commit_tag("v0.1.46")                                                       # device.hpp changed: the Meteor Lake patch will not apply
+        self.write(self.up, "sycl/include/dpct/device.hpp", DEVICE_02); self.write(self.up, "CMakeLists.txt", "project(strata VERSION 0.1.48 LANGUAGES CXX)\n")
+        self.write(self.up, "setup.py", "MIN_ENGINE = (0, 1, 46)   # 0.2\n"); self.commit_tag("v0.2.3")      # the 0.2 series: the tag says 0.2.3, the engine it builds says 0.1.48
         # the four kit patches (made against 0.1.44.1; the last two are made on top of the dashboard patch)
         self.mkpatch("mtl-igpu-local.patch", "sycl/include/dpct/device.hpp", DEVICE, DEVICE + "// MTL: the integrated flag for PCI device 7d55 is set here for the iGPU\n")
         v2 = XE + "def gt_active_time(card):\n    return read_idle_residency(card) / 1000.0 if card else None\n" + SUBTITLE_V2
         self.mkpatch("xe-monitor-v2.patch", "sycl/serve/xe_telemetry.py", XE, v2)
         pw = v2.replace("else None", "else 0.0") + "def package_power_watts(card):\n    return read_rapl_energy_delta(card) / elapsed_seconds()\n"
         self.mkpatch("xe-power.patch", "sycl/serve/xe_telemetry.py", v2, pw)
+        self.mkpatch("mtl-igpu-local.0.2.patch", "sycl/include/dpct/device.hpp", DEVICE_02, DEVICE_02 + "// MTL: the integrated flag for PCI device 7d55 is set here for the iGPU\n")      # the same patch, remade for the 0.2 code
         self.pw = pw; self.quiet = pw.replace(SUBTITLE_V2, SUBTITLE_QUIET)                # the quiet patch drops the throttle entry from the card subtitle
         self.mkpatch("xe-monitor-quiet.patch", "sycl/serve/xe_telemetry.py", pw, self.quiet)
         # the working copy: 0.1.44.1 with the patches on, an engine, configs and a run script
@@ -134,6 +138,43 @@ class Update(unittest.TestCase):
         self.write(self.ws, "sycl/serve/xe_telemetry.py", self.quiet.replace("clock_text(card)]", "clock_text(card) or '']"))     # close to the patch, not the same
         before = self.snap(); rc, out = self.t("apply", "--to", "v0.1.45", "--yes"); self.assertEqual(rc, 1, out)
         self.assertIn("does not explain", out); self.assertIn("Back where you were", out); self.assertEqual(self.snap(), before)         # stopped and undone: the hand edit is still there, byte for byte
+    def test_a_newer_series_uses_the_remade_patch_and_its_own_engine_version(self):
+        before = self.snap()
+        rc, out = self.t("check", "--to", "v0.2.3", "--no-fetch"); self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"mtl-igpu-local\.patch\s+applies cleanly \(as mtl-igpu-local\.0\.2\.patch\)"); self.assertIn("VERDICT: ready", out)
+        rc, out = self.t("apply", "--to", "v0.2.3", "--yes"); self.assertEqual(rc, 0, out)
+        self.assertIn("engine rebuilt: reports 0.1.48", out)                                          # the tag says 0.2.3; the build says 0.1.48
+        with open(os.path.join(self.ws, "sycl/include/dpct/device.hpp")) as fh: t = fh.read()
+        self.assertIn("MTL: the integrated flag", t); self.assertIn("return 2;", t)                    # the 0.2 file, with the Meteor Lake change on it
+        rc, out = self.t("rollback", "--yes"); self.assertEqual(rc, 0, out)
+        self.assertEqual(self.snap(), before)                                                         # back on 0.1.44.1 with the ORIGINAL patch (the 0.2 variant does not apply there)
+        with open(os.path.join(self.ws, "sycl/include/dpct/device.hpp")) as fh: self.assertIn("return 1;", fh.read())
+    def test_a_build_is_judged_by_what_it_printed_not_by_its_exit_status(self):
+        ok = dict(self.env, STRATA_UPDATE_BUILD_CMD=BUILD + "; echo errors: 0; exit 1")                # build.sh 0.1.x: prints BUILD EXIT 0 and errors: 0, then exits 1
+        rc, out = self.t("apply", "--to", "v0.1.45", "--yes", env=ok); self.assertEqual(rc, 0, out); self.assertIn("engine rebuilt: reports 0.1.45", out)
+        self.assertEqual(self.t("rollback", "--yes")[0], 0)
+        for text in ("echo BUILD EXIT 1; echo errors: 3; exit 1",                                      # a real failure
+                     "printf 'ELF engine=0.1.45\\0' > /dev/null; echo BUILD EXIT 0; echo errors: 2; exit 1",    # exit 0 printed, but errors counted
+                     "echo no build output at all; exit 1"):
+            before = self.snap(); rc, out = self.t("apply", "--to", "v0.1.45", "--yes", env=dict(self.env, STRATA_UPDATE_BUILD_CMD=text))
+            self.assertEqual(rc, 1, out); self.assertIn("the engine build failed", out); self.assertEqual(self.snap(), before, text)
+    def test_the_0_2_compat_entries_are_offered_and_respect_what_the_config_already_says(self):
+        rc, out = self.t("check", "--to", "v0.2.3", "--no-fetch"); self.assertEqual(rc, 0, out)
+        for needle in ("ACTION: a request with no sampling settings", "ACTION: a request whose max_tokens", "info: the new Intel prompt defaults", "info: 'one speed number everywhere'",
+                       "info: Intel Arc is now a released engine package", "info: the engine a 0.2.x tag builds reports its own number"): self.assertIn(needle, out)
+        cfgp = os.path.join(self.ws, "strata-swift-iq3_xxs.json")
+        with open(cfgp) as fh: c = json.load(fh)
+        c["fit_max_tokens"] = True                                                                     # the settled config says it already
+        with open(cfgp, "w") as fh: json.dump(c, fh)
+        rc, out = self.t("check", "--to", "v0.2.3", "--no-fetch"); self.assertNotIn("ACTION: a request whose max_tokens", out)
+        self.assertIn("no action needed: a request whose max_tokens", out)                              # listed, but said not to need anything
+        rc, out = self.t("apply", "--to", "v0.2.3", "--yes"); self.assertEqual(rc, 0, out)
+        with open(cfgp) as fh: c = json.load(fh)
+        self.assertIs(c["fit_max_tokens"], True); self.assertEqual(c["sampling"], {"temperature": 0, "presence_penalty": 0})       # kept as it was; the 0.1.45 block still added
+    def test_without_the_key_the_old_answer_is_kept_on_request(self):
+        rc, out = self.t("apply", "--to", "v0.2.3", "--yes"); self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.ws, "strata-swift-iq3_xxs.json")) as fh: c = json.load(fh)
+        self.assertIs(c["fit_max_tokens"], False)
     def test_already_at_the_target(self):
         rc, out = self.t("check", "--to", "v0.1.44.1", "--no-fetch"); self.assertIn("Already at v0.1.44.1", out)
 

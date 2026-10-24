@@ -195,7 +195,7 @@ def make_home(src, mock_port, catalog=None):
 
 
 def provider_of(home):
-    text = open(os.path.join(home, "config.toml")).read()
+    with open(os.path.join(home, "config.toml")) as fh: text = fh.read()
     return "strata_front" if "[model_providers.strata_front]" in text else None
 
 
@@ -370,24 +370,49 @@ def probe_title(ctx):
         t.close(); mock.close(); shutil.rmtree(home, ignore_errors=True)
 
 
-def probe_shortcuts(ctx):
-    r = Result("shortcuts")
-    mock = Mock(); home = make_home(ctx.home, mock.port, ctx.catalog)
-    t = Tui(ctx.codex, home, ctx.work, tui_args(home))
-    try:
-        t.pump(9)
-        os.write(t.fd, b"\x1b."); s1 = t.pump(1.5)
-        if "unavailable" in s1.lower():
-            return r.fail("Codex says the reasoning shortcuts are unavailable for strata: " + s1[-120:])
-        os.write(t.fd, b"\x1b."); t.pump(1.0)
-        os.write(t.fd, b"\x1b,"); t.pump(1.0)
-        t.type_line("hello"); t.wait_for(lambda: bool(mock.main), 20)
-        eff = ((mock.main[0].get("reasoning") or {}).get("effort") if mock.main else None)
-        if eff != "medium":
-            return r.fail(f"after Alt+. Alt+. Alt+, the request carries effort {eff!r}, expected 'medium' (the keys may have moved: check /keymap)")
-        return r.ok("Alt+. and Alt+, change the level, and the request carries it")
-    finally:
-        t.close(); mock.close(); shutil.rmtree(home, ignore_errors=True)
+LEVELS = ["none", "low", "medium", "high"]
+
+
+def after_keys(start):
+    """Where Alt+. Alt+. Alt+, ends from `start` (up, up, down; the ends are clamped)."""
+    i = LEVELS.index(start); i = min(3, i + 1); i = min(3, i + 1); i = max(0, i - 1)
+    return LEVELS[i]
+
+
+def probe_shortcuts(ctx, attempts=3):
+    """Alt+. raises and Alt+, lowers the reasoning level, and the next request carries it.
+    The probe does not assume where the level starts (that comes from your config.toml and the catalog's default, and differs between homes: a start at `none` ends
+    at `low` after up, up, down, which an older version of this probe called a failure). It sends a first message to see the starting level, presses the keys,
+    sends a second one, and compares the second request with where up, up, down must end from THAT start (the ends are clamped).
+    A slow start can still lose a key, so a wrong result is tried again in a fresh interface (up to `attempts`); a pass that needed a retry is a warning."""
+    r = Result("shortcuts"); seen = []
+    for attempt in range(1, attempts + 1):
+        mock = Mock(); home = make_home(ctx.home, mock.port, ctx.catalog)
+        t = Tui(ctx.codex, home, ctx.work, tui_args(home))
+        try:
+            t.pump(9)
+            t.type_line("hello"); t.wait_for(lambda: len(mock.main) >= 1, 20); t.pump(4)
+            os.write(t.fd, b"\x1b."); s1 = t.pump(1.5)
+            if "unavailable" in s1.lower():
+                return r.fail("Codex says the reasoning shortcuts are unavailable for strata: " + s1[-120:])
+            os.write(t.fd, b"\x1b."); t.pump(1.0)
+            os.write(t.fd, b"\x1b,"); t.pump(1.0)
+            t.type_line("again"); t.wait_for(lambda: len(mock.main) >= 2, 20)
+            eff = lambda k: ((mock.main[k].get("reasoning") or {}).get("effort") if len(mock.main) > k else None)
+            start, end = eff(0), eff(1)
+        finally:
+            t.close(); mock.close(); shutil.rmtree(home, ignore_errors=True)
+        seen.append((start, end))
+        if start not in LEVELS:
+            continue
+        want = after_keys(start)
+        if end == want:
+            r.ok(f"Alt+. Alt+. Alt+, took the level from {start!r} to {end!r}, and the request carries it")
+            return r.warn(f"passed on attempt {attempt} of {attempts}: an earlier start was too slow for the keys") if attempt > 1 else r
+    start, end = seen[-1]
+    if start not in LEVELS:
+        return r.fail(f"the first request carried no reasoning level that this probe knows (effort {start!r}); starts seen: {seen}. Check model_reasoning_effort in config.toml and the catalog's default_reasoning_level")
+    return r.fail(f"the level started at {start!r}; after Alt+. Alt+. Alt+, the request carried {end!r}, expected {after_keys(start)!r}, in each of {attempts} fresh starts (starts seen: {seen}; the keys may have moved: check /keymap)")
 
 
 def probe_paste(ctx):

@@ -60,6 +60,28 @@ COMPAT = [
     {"id": "answer-room", "since": (0, 1, 45), "info": True,
      "title": "max_tokens now counts the thinking; without a thinking budget the thinking is cut early to leave a quarter of the cap for the answer. "
               "Your configs set reasoning_budget_tokens, so this should not change anything (\"answer_room\": false turns it off)."},
+    # ---- the 0.2 series (read from the release notes and the source at v0.2.3 on 2026-10-23; none of it has run on this machine) ----
+    {"id": "fit-max-tokens", "since": (0, 2, 0),
+     "title": "a request whose max_tokens is more than the room the prompt leaves in the context used to get HTTP 400; fit_max_tokens now defaults to true and shortens it",
+     "applies": lambda cfg: "fit_max_tokens" not in cfg,
+     "fix": {"fit_max_tokens": False},
+     "why": "keeps the old answer (a 400) for a config that does not say. The settled config sets \"fit_max_tokens\": true already, so it is not touched; Codex normally benefits from the "
+            "new default, so say no here unless you want errors instead of shortened answers."},
+    {"id": "intel-defaults-not-for-this-gpu", "since": (0, 2, 0), "info": True,
+     "title": "the new Intel prompt defaults (XMX grouped experts on Arc A-series, int8 experts on Battlemage) do not switch on for the Meteor Lake iGPU: the engine classifies a GPU by "
+              "architecture, PCI id or name and this one is neither (read in sycl/include/strata/sycl_queue.hpp, prefill.cpp, xmx_moe.dp.cpp). Not run: after the update the start log "
+              "should show no 'int8 prompt experts are on' line, and prompt speed should match the earlier ABBA numbers."},
+    {"id": "workers-low-power-cores", "since": (0, 2, 1), "info": True,
+     "title": "the engine and setup count the CPU's low-power E cores (cpu_lowpower) as efficiency cores, so the default worker count of a hybrid CPU such as the Core Ultra 5 125H may change "
+              "(the release notes: a 255H went from 15 to 10). The settled config pins --pool-workers 8, which wins; a config without it will get a different count."},
+    {"id": "speed-number", "since": (0, 2, 2), "info": True,
+     "title": "'one speed number everywhere': tokens per second is now every token the model produced (thinking, answer, tool calls; with MTP the kept tokens) divided by decode time, in the chat "
+              "footer, the monitor, the model API and the server console. A figure shown after the update is not comparable with one from 0.1.45; compare with strata-bench2.py on both."},
+    {"id": "engine-package", "since": (0, 2, 3), "info": True,
+     "title": "Intel Arc is now a released engine package that `strata launch` and `strata update` fetch. Do not use those stock commands on this machine: they would replace the engine you build "
+              "from source and ignore the kit's patches. Keep using this tool (it builds in the strata-sycl-dev image)."},
+    {"id": "engine-version", "since": (0, 2, 0), "info": True,
+     "title": "the engine a 0.2.x tag builds reports its own number (v0.2.3 builds engine 0.1.48; MIN_ENGINE is 0.1.46). This tool reads it from the target's CMakeLists.txt and checks the build against it."},
 ]
 
 
@@ -159,12 +181,46 @@ def show(repo, ref, path):
     return r.stdout if r.returncode == 0 else ""
 
 
+def engine_version_of(repo, ref):
+    """The engine version a build of REF reports: `project(strata VERSION x)` in its CMakeLists.txt (v0.2.3 is engine 0.1.48), else the tag's own numbers."""
+    m = re.search(r"project\(\s*strata\s+VERSION\s+([0-9][0-9.]*)", show(repo, ref, "CMakeLists.txt"), re.I)
+    return m.group(1).rstrip(".") if m else ".".join(str(x) for x in vkey(ref))
+
+
 def min_engine(repo, ref):
     m = re.search(r"^MIN_ENGINE = \(([0-9, ]+)\)", show(repo, ref, "setup.py"), re.M)
     return ".".join(x.strip() for x in m.group(1).split(",")) if m else None
 
 
 # ---- the patches ---------------------------------------------------------------------------------------------------------------
+def variants(pdir, name):
+    """The kit's files for ONE patch: NAME.patch, then NAME.SERIES.patch for a newer Strata line (mtl-igpu-local.0.2.patch).
+    The same change is remade when upstream rewrites the code around it; which file fits is decided by trying it on the tree."""
+    stem = name[:-len(".patch")]
+    first = os.path.join(pdir, name)
+    return ([first] if os.path.isfile(first) else []) + sorted(glob.glob(os.path.join(pdir, stem + ".*.patch")))
+
+
+def have_patch(pdir, name):
+    return bool(variants(pdir, name))
+
+
+def pick(repo, pdir, name, reverse=False):
+    """(the variant of NAME that git can apply (or take off) on this tree now, the first error)."""
+    err = ""
+    for v in variants(pdir, name):
+        r = run(["git", "-C", repo, "apply", *(["-R"] if reverse else []), "--check", v], check=False)
+        if r.returncode == 0:
+            return v, ""
+        err = err or r.stderr.strip()
+    return None, err
+
+
+def all_files(pdir, name):
+    """Files any variant of the patch touches."""
+    return sorted({f for v in variants(pdir, name) for f in patch_files(v)[0]})
+
+
 def patch_files(patch):
     """(files the patch touches, files it creates)."""
     touched, created, last = [], [], None
@@ -201,11 +257,10 @@ def applied_ratio(repo, patch):
 
 def applied_patches(repo, pdir):
     """Which kit patches are on this checkout (the power and quiet patches are made on top of the dashboard patch, so each implies it)."""
-    names = [n for n in PATCHES if os.path.isfile(os.path.join(pdir, n))]
+    names = [n for n in PATCHES if have_patch(pdir, n)]
     on = []
     for n in names:
-        hit, tot = applied_ratio(repo, os.path.join(pdir, n))
-        if tot and hit * 100 // tot >= 80:
+        if any((lambda ht: ht[1] and ht[0] * 100 // ht[1] >= 80)(applied_ratio(repo, v)) for v in variants(pdir, n)):
             on.append(n)
     for n, need in NEEDS.items():                                    # the later patch rewrites lines the earlier one added, so the earlier one may look partly applied
         if n in on and need not in on and need in names:
@@ -216,10 +271,9 @@ def applied_patches(repo, pdir):
 def apply_patches(repo, pdir, names):
     done = []
     for n in names:
-        p = os.path.join(pdir, n)
-        r = run(["git", "-C", repo, "apply", "--check", p], check=False)
-        if r.returncode:
-            raise Stop(f"{n} does not apply to this version: {r.stderr.strip()[:300]}")
+        p, err = pick(repo, pdir, n)
+        if not p:
+            raise Stop(f"{n} does not apply to this version: {err[:300]}")
         git(repo, "apply", p)
         done.append(n)
     return done
@@ -228,16 +282,17 @@ def apply_patches(repo, pdir, names):
 def reverse_patches(repo, pdir, names, force):
     """Take the patches off, newest first. If the files carry changes beyond the patches, stop (or, with force, set them aside: the diff is saved)."""
     for n in reversed(names):
-        p = os.path.join(pdir, n)
-        r = run(["git", "-C", repo, "apply", "-R", "--check", p], check=False)
-        if r.returncode == 0:
+        p, err = pick(repo, pdir, n, reverse=True)
+        if p:
             git(repo, "apply", "-R", p)
             continue
         if not force:
-            raise Stop(f"your files have changes the kit's {n} does not explain ({r.stderr.strip()[:200]}). "
+            raise Stop(f"your files have changes the kit's {n} does not explain ({err[:200]}). "
                        f"The full diff is in the backup; use --force to set them aside, or look at them first:  git -C {repo} diff")
-        touched, created = patch_files(p)
-        for f in touched:
+        touched, created = set(), set()
+        for v in variants(pdir, n):
+            t, c = patch_files(v); touched.update(t); created.update(c)
+        for f in sorted(touched):
             fp = os.path.join(repo, f)
             if f in created:
                 if os.path.exists(fp):
@@ -310,19 +365,18 @@ def cmd_check(repo, pdir, to, fetch):
     ok_all = True
     try:
         say("\nDo the kit's patches apply to the new release?")
-        for name in [x for x in PATCHES if os.path.isfile(os.path.join(pdir, x))]:
-            p = os.path.join(pdir, name)
-            r = run(["git", "-C", wt, "apply", "--check", p], check=False)
-            if r.returncode == 0:
-                git(wt, "apply", p); say(f"  {name:24s} applies cleanly")
+        for name in [x for x in PATCHES if have_patch(pdir, x)]:
+            p, err = pick(wt, pdir, name)
+            if p:
+                git(wt, "apply", p); say(f"  {name:24s} applies cleanly" + (f" (as {os.path.basename(p)})" if os.path.basename(p) != name else ""))
             else:
-                ok_all = False; say(f"  {name:24s} DOES NOT APPLY: {r.stderr.strip().splitlines()[0][:110] if r.stderr.strip() else '?'}")
+                ok_all = False; say(f"  {name:24s} DOES NOT APPLY: {err.splitlines()[0][:110] if err else '?'}")
                 say("      (the Strata files it patches changed upstream; the patch needs a new version first. Do not update until it is fixed.)")
     finally:
         drop_worktree(repo, wt)
     # 2. what changed in the files the patches carry
     changed = set(git(repo, "diff", "--name-only", base, target).split()) if base in tags else set()
-    touched = {f for name in PATCHES if os.path.isfile(os.path.join(pdir, name)) for f in patch_files(os.path.join(pdir, name))[0]}
+    touched = {f for name in PATCHES for f in all_files(pdir, name)}
     both = sorted(changed & touched)
     say("\nPatched files that upstream also changed: " + (", ".join(both) if both else "none"))
     me_now, me_new = min_engine(repo, base) if base in tags else None, min_engine(repo, target)
@@ -341,7 +395,7 @@ def cmd_check(repo, pdir, to, fetch):
     if comp:
         say("\nBehaviour changes that matter for your configs (known for this release):")
         for e, names in comp:
-            say(f"  {'info' if e.get('info') else 'ACTION'}: {e['title']}")
+            say(f"  {'info' if e.get('info') else 'ACTION' if names else 'no action needed'}: {e['title']}")
             if names:
                 say(f"      applies to: {', '.join(names)}.  `apply` offers to add {json.dumps(e['fix'])}")
     say("\nBefore you decide: read those lists for anything that changes a default on Intel (a kernel, a memory setting, how thinking tokens are counted).")
@@ -357,7 +411,7 @@ def backup_dir_for(frm, to):
 
 def kit_patch_files(pdir):
     """Every file any kit patch touches (the patches may be on, off, or replaced by a hand edit)."""
-    return sorted({f for n in PATCHES if os.path.isfile(os.path.join(pdir, n)) for f in patch_files(os.path.join(pdir, n))[0]})
+    return sorted({f for n in PATCHES for f in all_files(pdir, n)})
 
 
 def snapshot_patched_files(repo, bdir, pdir):
@@ -428,8 +482,11 @@ def build_engine(repo):
         os.utime(os.path.join(repo, "sycl", "CMakeLists.txt"), None)               # forces the version to be reconfigured
         r = subprocess.run(["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-v", f"{os.path.dirname(repo)}:/work", "-e", f"REPO=/work/{name}",
                             "-e", f"BUILD_DIR=/work/{name}/build-sycl", "strata-sycl-dev", f"cd /work/{name} && bash sycl/tools/build.sh strata"], capture_output=True, text=True)
-    tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-6:])
-    if r.returncode:
+    out = r.stdout + r.stderr
+    tail = "\n".join(out.strip().splitlines()[-6:])
+    # sycl/tools/build.sh (0.1.x) ends in `grep ... | head` under `set -o pipefail`: it exits 1 after a build that printed BUILD EXIT 0 and errors: 0
+    printed_ok = bool(re.search(r"^BUILD EXIT 0\s*$", out, re.M)) and bool(re.search(r"^errors: 0\s*$", out, re.M))
+    if r.returncode and not printed_ok:
         raise Stop(f"the engine build failed:\n{tail}")
     return tail
 
@@ -475,7 +532,7 @@ def cmd_apply(repo, pdir, to, yes, force, skip_build, skip_tests, no_compat=Fals
     frm, on = current_version(repo), None
     on = applied_patches(repo, pdir)
     mod = [ln[3:] for ln in git(repo, "status", "--porcelain", "--untracked-files=no").splitlines()]
-    allowed = {f for n in on for f in patch_files(os.path.join(pdir, n))[0]}
+    allowed = {f for n in on for f in all_files(pdir, n)}
     stray = [f for f in mod if f not in allowed]
     if stray and not force:
         say("Changes in your checkout that the kit's patches do not explain:\n  " + "\n  ".join(stray[:10]) +
@@ -502,7 +559,7 @@ def cmd_apply(repo, pdir, to, yes, force, skip_build, skip_tests, no_compat=Fals
         if not skip_build:
             tail = build_engine(repo)
             ev = engine_version(repo)
-            want = ".".join(str(x) for x in vkey(to))
+            want = engine_version_of(repo, to)
             if ev != want:
                 raise Stop(f"the engine built reports {ev!r}, expected {want!r}")
             say(f"4. engine rebuilt: reports {ev}")

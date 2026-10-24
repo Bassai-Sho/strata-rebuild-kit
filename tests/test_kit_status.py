@@ -56,6 +56,14 @@ class PatchState(unittest.TestCase):
     def test_quiet_patch_with_nothing_else_is_reported_with_its_foundation(self):
         self.write_repo(BASE + V2.replace(SUB, SUB_QUIET)); mtl, dash, power = self.states()                   # the dashboard patch's lines, minus the throttle note
         self.assertTrue(dash.startswith("applied"), dash)
+    def test_a_patch_remade_for_a_newer_line_is_recognised_whichever_file_fits(self):
+        line = "# mtl 0.2: the integrated flag for PCI 7d55, remade for the 0.2 code\n"
+        base_b = BASE.replace("def read_value(path):", "def read_value(path, mode=None):")                         # the 0.2 code: a line next to the patch was rewritten
+        with open(os.path.join(self.kit, "patches", "mtl-igpu-local.0.2.patch"), "w") as fh: fh.write(diff(base_b, base_b + line))
+        self.write_repo(base_b + line); self.assertEqual(self.states()[0], "applied")                          # the remade patch is on: only the variant says so
+        self.write_repo(base_b); mtl = self.states()[0]
+        self.assertTrue(mtl.startswith("not applied; it applies cleanly"), mtl)                                 # the first file does not fit this tree, the variant does
+        self.write_repo(BASE + "# mtl: integrated flag for PCI 7d55 is set here\n"); self.assertEqual(self.states()[0], "applied")   # the original is still recognised with the variant beside it
     def test_meteor_lake(self):
         self.write_repo(BASE + "# mtl: integrated flag for PCI 7d55 is set here\n"); self.assertEqual(self.states()[0], "applied")
 

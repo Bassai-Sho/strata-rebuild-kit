@@ -97,6 +97,7 @@ sync_bin "$HERE/unix-relay.py" "$AGENT/bin/unix-relay.py" "the in-container rela
 sync_bin "$HERE/make-model-catalog.py" "$AGENT/bin/make-model-catalog.py" "the model-catalog generator (rerun it after updating Codex)"
 sync_bin "$HERE/slim-instructions.md" "$AGENT/bin/slim-instructions.md" "the slim base instructions the generator puts in the catalog"
 sync_bin "$HERE/synth_compact.py" "$AGENT/bin/synth_compact.py" "the compaction shortcut (the filter answers Codex's compaction request at once)"
+sync_bin "$HERE/apply_patch_rescue.py" "$AGENT/bin/apply_patch_rescue.py" "the apply_patch repair (a call the model wrote as text becomes a real call)"
 sync_bin "$HERE/codex-stats.py" "$AGENT/bin/codex-stats.py" "codex-stats.py (where a session's time and context went)"
 # the model catalog: without it Codex does not know the reasoning levels of `strata` and the shortcuts Alt+. and Alt+, say "unavailable"
 ksync codex-home/model-catalog.json "$HERE/model-catalog.json" "$AGENT/codex-home/model-catalog.json" "the model catalog (reasoning shortcuts)" 644

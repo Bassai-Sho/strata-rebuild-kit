@@ -50,6 +50,37 @@ class Harness(unittest.TestCase):
             r = cc.probe_features(ctx); self.assertEqual(r.status, "fail"); self.assertIn("multi_agent", r.detail)         # a missing flag is named
             r = cc.probe_config(ctx); self.assertEqual(r.status, "fail"); self.assertIn("no request reached", r.detail)    # a codex that never calls the model
         finally: shutil.rmtree(d, ignore_errors=True)
+    def _shortcuts_with(self, pairs):
+        """probe_shortcuts with a fake interface: each fresh start sends two requests, whose efforts are the (start, end) pair given for it (no Codex, no waiting)."""
+        import unittest.mock as um
+        mocks, n = [], [0]
+        class FakeMock:
+            def __init__(self, *a): self.port, self.main = 1, []; mocks.append(self)
+            def close(self): pass
+        class FakeTui:
+            def __init__(self, *a, **k): self._r, self.fd = os.pipe(); n[0] += 1; self.i = n[0] - 1; self.sent = 0
+            def pump(self, sec): return ""
+            def type_line(self, text): mocks[-1].main.append({"reasoning": {"effort": pairs[self.i][self.sent]}}); self.sent += 1
+            def wait_for(self, fn, timeout): return fn()
+            def close(self): os.close(self._r); os.close(self.fd)
+        ctx = cc.Ctx(); ctx.codex, ctx.home, ctx.catalog, ctx.work = "x", None, None, tempfile.gettempdir()
+        with um.patch.object(cc, "Mock", FakeMock), um.patch.object(cc, "Tui", FakeTui), um.patch.object(cc, "make_home", lambda *a, **k: tempfile.mkdtemp()), \
+             um.patch.object(cc, "tui_args", lambda *a, **k: []):
+            return cc.probe_shortcuts(ctx), n[0]
+    def test_shortcuts_are_judged_from_where_the_level_started(self):
+        for start, end in (("low", "medium"), ("none", "low"), ("medium", "medium"), ("high", "medium")):       # up, up, down from each start; the ends are clamped
+            r, starts = self._shortcuts_with([(start, end)]); self.assertEqual((r.status, starts), ("pass", 1), (start, end))
+            self.assertIn(f"from {start!r} to {end!r}", r.detail)
+        self.assertEqual({k: cc.after_keys(k) for k in cc.LEVELS}, {"none": "low", "low": "medium", "medium": "medium", "high": "medium"})
+    def test_a_start_at_none_used_to_be_called_a_failure(self):
+        r, _ = self._shortcuts_with([("none", "low")]); self.assertEqual(r.status, "pass")                         # the old probe expected 'medium' whatever the start was
+    def test_the_shortcuts_probe_retries_a_lost_key_but_not_a_moved_keymap(self):
+        r, starts = self._shortcuts_with([("low", "low"), ("low", "medium")]); self.assertEqual((r.status, starts), ("warn", 2)); self.assertIn("attempt 2 of 3", r.detail)
+        r, starts = self._shortcuts_with([("low", "low")] * 3); self.assertEqual((r.status, starts), ("fail", 3))
+        self.assertIn("started at 'low'", r.detail); self.assertIn("expected 'medium'", r.detail); self.assertIn("starts seen", r.detail)    # says what it saw
+        r, starts = self._shortcuts_with([("none", "none")] * 3); self.assertEqual(r.status, "fail"); self.assertIn("expected 'low'", r.detail)
+    def test_a_first_request_with_no_level_is_reported_as_that(self):
+        r, starts = self._shortcuts_with([(None, None)] * 3); self.assertEqual((r.status, starts), ("fail", 3)); self.assertIn("no reasoning level", r.detail)
     def test_the_probe_list_is_what_the_docs_say(self):
         names = [p.__name__[6:].replace("_", "-") for p in cc.PROBES]
         self.assertEqual(names, ["version", "config", "features", "tools", "rules", "tool-run", "loop-command", "interactive", "title", "shortcuts", "paste", "autopilot", "strata"])

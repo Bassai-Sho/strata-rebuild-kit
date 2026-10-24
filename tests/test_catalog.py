@@ -20,7 +20,7 @@ class Catalog(unittest.TestCase):
         self.assertFalse(self.model["use_responses_lite"]); self.assertFalse(self.model["prefer_websockets"])
         self.assertIsNone(self.model["apply_patch_tool_type"]); self.assertEqual(self.model["input_modalities"], ["text"])
     def test_base_instructions_and_window(self):
-        self.assertTrue(self.model["base_instructions"].startswith("You are a coding agent running in the Codex CLI"))
+        self.assertTrue(self.model["base_instructions"].startswith("You are a coding agent in the Codex CLI"))
         self.assertEqual((self.model["context_window"], self.model["auto_compact_token_limit"]), (65536, 48000))
     def test_generator_template_matches_the_shipped_catalog(self):
         gen = load(os.path.join(KIT, "agent", "make-model-catalog.py"), "gen")

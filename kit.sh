@@ -16,7 +16,21 @@ URL="${STRATA_URL:-http://127.0.0.1:8085}"
 say() { printf '%s\n' "$*"; }
 KITVER="$(cat "$KIT/VERSION" 2>/dev/null || echo unknown)"
 
-patch_state() {   # patch_state FILE STEP : applied / partly applied / can be applied / does not apply
+patch_state() {   # patch_state NAME STEP : the state of one patch across the kit's files for it (NAME.patch and NAME.SERIES.patch, remade for newer Strata lines)
+  local name="$1" step="${2:-8}" stem f s best="" clean=""
+  stem="${name%.patch}"
+  if [ ! -f "$KIT/patches/$name" ] && ! ls "$KIT/patches/$stem".*.patch >/dev/null 2>&1; then echo "(not in this kit)"; return; fi
+  for f in "$name" $(cd "$KIT/patches" 2>/dev/null && ls "$stem".*.patch 2>/dev/null); do
+    [ -f "$KIT/patches/$f" ] || continue
+    s="$(patch_state_one "$f" "$step")"
+    case "$s" in applied*) echo "$s"; return ;; esac
+    case "$s" in "not applied; it applies cleanly"*) [ -n "$clean" ] || clean="$s" ;; esac
+    [ -n "$best" ] || best="$s"
+  done
+  echo "${clean:-$best}"
+}
+
+patch_state_one() {   # patch_state_one FILE STEP : applied / partly applied / can be applied / does not apply
   local p="$KIT/patches/$1" step="${2:-8}"
   [ -f "$p" ] || { echo "(not in this kit)"; return; }
   [ -d "$STRATA/.git" ] || { echo "(no Strata repository at $STRATA)"; return; }
